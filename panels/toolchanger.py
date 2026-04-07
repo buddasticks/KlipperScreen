@@ -23,6 +23,7 @@ import math
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -231,6 +232,7 @@ def make_css(theme: Dict[str, str]) -> bytes:
 .tc-badge-parked {{ background-color: {theme['btn_bg']}; color: {theme['text']}; border-radius: 6px; font-size: 11px; font-weight: 800; padding: 2px 8px; border: 1px solid {theme['btn_border']}; }}
 .tc-badge-error {{ background-color: #3a0a0a; color: #ff4444; border-radius: 6px; font-size: 11px; font-weight: 800; padding: 2px 8px; border: 1px solid #aa2222; }}
 .tc-badge-changing {{ background-color: #002a4a; color: #44c8ff; border-radius: 6px; font-size: 11px; font-weight: 800; padding: 2px 8px; border: 1px solid #44c8ff; }}
+.tc-badge-pid {{ background-color: #3a123f; color: #ff8cff; border-radius: 6px; font-size: 11px; font-weight: 800; padding: 2px 8px; border: 1px solid #ff8cff; }}
 .tc-popup {{ background-color: {theme['card']}; border: 2px solid {accent}; border-radius: 15px; }}
 .tc-popup-title {{ color: {theme['text']}; font-size: 24px; font-weight: 900; }}
 .tc-popup-subtitle {{ color: {theme['muted']}; font-size: 11px; font-weight: 700; }}
@@ -266,7 +268,7 @@ class ToolState:
 
     @property
     def display_title(self) -> str:
-        return f"TOOL {self.index + 1}"
+        return f"T{self.index}"
 
     @property
     def is_heating(self) -> bool:
@@ -280,6 +282,8 @@ class ToolState:
             return "ERROR"
         if self.ktc_state == "error":
             return "ERROR"
+        if self.ktc_state == "pid_tuning":
+            return "PID TUNE"
         if self.ktc_state == "active":
             return "ACTIVE"
         if self.ktc_state == "changing":
@@ -296,6 +300,8 @@ class ToolState:
             return "tc-badge-error"
         if self.ktc_state == "error":
             return "tc-badge-error"
+        if self.ktc_state == "pid_tuning":
+            return "tc-badge-pid"
         if self.ktc_state == "active":
             return "tc-badge-active"
         if self.ktc_state == "changing":
@@ -361,6 +367,8 @@ class ToolchangerPanel:
         self._command_queue: "queue.Queue[str]" = queue.Queue()
         self._command_thread: Optional[threading.Thread] = None
         self._active_popup: Optional[Gtk.Window] = None
+        self._pid_tuning_tool_index: Optional[int] = None
+        self._pid_tuning_started_at: Optional[float] = None
 
         self._css_provider = Gtk.CssProvider()
         Gtk.StyleContext.add_provider_for_screen(
@@ -896,6 +904,29 @@ class ToolchangerPanel:
                 state.color_hex = "#333b54"
                 state.remaining_ratio = -1.0
 
+        if self._pid_tuning_tool_index is not None:
+            idx = self._pid_tuning_tool_index
+
+            if idx >= len(base_states):
+                self._pid_tuning_tool_index = None
+                self._pid_tuning_started_at = None
+            else:
+                pid_state = base_states[idx]
+                pid_elapsed = 0.0
+                if self._pid_tuning_started_at is not None:
+                    pid_elapsed = max(0.0, time.monotonic() - self._pid_tuning_started_at)
+
+                if pid_state.ktc_state == "error":
+                    self._pid_tuning_tool_index = None
+                    self._pid_tuning_started_at = None
+                elif pid_state.ktc_state == "changing":
+                    pass
+                elif pid_state.target > 0 or pid_elapsed < 8.0:
+                    pid_state.ktc_state = "pid_tuning"
+                else:
+                    self._pid_tuning_tool_index = None
+                    self._pid_tuning_started_at = None
+
         return RuntimeSnapshot(tools=base_states, moonraker_ok=True)
 
     def _refresh_tool_count_from_moonraker(self) -> None:
@@ -956,7 +987,7 @@ class ToolchangerPanel:
                 frame_ctx.remove_class("tc-card-active")
 
             badge_ctx = widgets.badge.get_style_context()
-            for cls in ("tc-badge-active", "tc-badge-heating", "tc-badge-parked", "tc-badge-error", "tc-badge-changing"):
+            for cls in ("tc-badge-active", "tc-badge-heating", "tc-badge-parked", "tc-badge-error", "tc-badge-changing", "tc-badge-pid"):
                 badge_ctx.remove_class(cls)
             widgets.badge.set_text(state.status_label)
             badge_ctx.add_class(state.status_css)
@@ -991,6 +1022,47 @@ class ToolchangerPanel:
     def _queue_gcode(self, command: str) -> None:
         self._command_queue.put(command)
 
+    def _start_pid_tune_command(self, tool_index: int, command: str) -> None:
+        self._pid_tuning_tool_index = tool_index
+        self._pid_tuning_started_at = time.monotonic()
+
+        if tool_index < len(self._tool_states):
+            self._tool_states[tool_index].ktc_state = "pid_tuning"
+            GLib.idle_add(self._apply_snapshot, RuntimeSnapshot(self._tool_states))
+
+        self._queue_gcode(command)
+
+    def _wait_for_tool_active_then_pid(self, tool_index: int, command: str) -> None:
+        attempts = {"count": 0}
+        max_attempts = 40
+
+        def poll() -> bool:
+            if tool_index >= len(self._tool_states):
+                return False
+
+            state = self._tool_states[tool_index]
+
+            if state.ktc_state == "error":
+                self._pid_tuning_tool_index = None
+                self._pid_tuning_started_at = None
+                self._show_message(f"T{tool_index} entered an error state")
+                return False
+
+            if state.active or state.ktc_state == "active":
+                self._start_pid_tune_command(tool_index, command)
+                return False
+
+            attempts["count"] += 1
+            if attempts["count"] >= max_attempts:
+                self._pid_tuning_tool_index = None
+                self._pid_tuning_started_at = None
+                self._show_message(f"T{tool_index} did not become active in time")
+                return False
+
+            return True
+
+        GLib.timeout_add(250, poll)
+
     # ------------------------------------------------------------------
     # Popup lifecycle helpers
     # ------------------------------------------------------------------
@@ -1024,7 +1096,7 @@ class ToolchangerPanel:
 
         if require_spool and not state.spool_id and not confirmed_empty:
             self._show_confirm_popup(
-                f"Tool {tool_index + 1} has no spool assigned.\n\nPick up this empty tool anyway?",
+                f"T{tool_index} has no spool assigned.\n\nPick up this empty tool anyway?",
                 lambda: self._request_tool_activation(
                     tool_index,
                     require_spool=require_spool,
@@ -1040,11 +1112,11 @@ class ToolchangerPanel:
 
         if state.ktc_state == "active" or state.active:
             if notify_if_active:
-                self._show_message(f"Tool {tool_index + 1} already active")
+                self._show_message(f"T{tool_index} already active")
             return True
 
         if state.ktc_state == "error":
-            self._show_message(f"Tool {tool_index + 1} is in error state")
+            self._show_message(f"T{tool_index} is in error state")
             return False
 
         state.ktc_state = "changing"
@@ -1063,7 +1135,7 @@ class ToolchangerPanel:
             state = self._tool_states[tool_index]
 
             if state.ktc_state == "error":
-                self._show_message(f"Tool {tool_index + 1} entered an error state")
+                self._show_message(f"T{tool_index} entered an error state")
                 return False
 
             if state.active or state.ktc_state == "active":
@@ -1072,7 +1144,7 @@ class ToolchangerPanel:
 
             attempts["count"] += 1
             if attempts["count"] >= max_attempts:
-                self._show_message(f"Tool {tool_index + 1} did not become active in time")
+                self._show_message(f"T{tool_index} did not become active in time")
                 return False
 
             return True
@@ -1088,7 +1160,7 @@ class ToolchangerPanel:
             return
 
         if state.ktc_state == "error":
-            self._show_message(f"Tool {tool_index + 1} is in error state")
+            self._show_message(f"T{tool_index} is in error state")
             return
 
         if state.active or state.ktc_state == "active":
@@ -1441,7 +1513,7 @@ class ToolchangerPanel:
         outer.set_margin_start(14)
         outer.set_margin_end(14)
 
-        header = Gtk.Label(label=f"SELECT SPOOL FOR TOOL {tool_index + 1}")
+        header = Gtk.Label(label=f"SELECT SPOOL FOR T{tool_index}")
         header.get_style_context().add_class("tc-tool-label")
         outer.pack_start(header, False, False, 0)
 
@@ -1663,78 +1735,399 @@ class ToolchangerPanel:
     def _show_pid_select(self) -> None:
         popup = self._register_popup(popup_window(self._screen))
 
-        inner = box(spacing=20)
-        inner.get_style_context().add_class("tc-popup")
-        inner.set_size_request(360, 240)
-        inner.set_margin_top(24)
-        inner.set_margin_bottom(24)
-        inner.set_margin_start(24)
-        inner.set_margin_end(24)
+        outer = box(spacing=10)
+        outer.get_style_context().add_class("tc-popup")
+        outer.set_size_request(660, 320)
+        outer.set_margin_top(16)
+        outer.set_margin_bottom(16)
+        outer.set_margin_start(16)
+        outer.set_margin_end(16)
 
-        header = Gtk.Label(label="PID TUNE - SELECT TOOL")
-        header.get_style_context().add_class("tc-tool-label")
-        inner.pack_start(header, False, False, 0)
+        header_box = box(spacing=2)
+        header_box.set_halign(Gtk.Align.CENTER)
 
-        row = box(Gtk.Orientation.HORIZONTAL, 12)
-        row.set_halign(Gtk.Align.CENTER)
+        title = Gtk.Label(label="PID TUNE - SELECT TOOL")
+        title.get_style_context().add_class("tc-popup-title")
+        title.set_xalign(0.5)
+
+        subtitle = Gtk.Label(label="Tap a tool card to tune it.")
+        subtitle.get_style_context().add_class("tc-popup-subtitle")
+        subtitle.set_xalign(0.5)
+
+        header_box.pack_start(title, False, False, 0)
+        header_box.pack_start(subtitle, False, False, 0)
+        outer.pack_start(header_box, False, False, 0)
+
+        cards_row = box(Gtk.Orientation.HORIZONTAL, 18)
+        cards_row.set_halign(Gtk.Align.CENTER)
+        cards_row.set_valign(Gtk.Align.CENTER)
+        cards_row.set_hexpand(True)
+        cards_row.set_vexpand(True)
+
         for state in self._tool_states:
-            b = button(
-                f"T{state.index}",
-                "tc-btn-select",
-                lambda _w, heater=state.heater_name: (popup.destroy(), self._show_pid_temp(heater)),
-            )
-            b.set_size_request(80, 80)
-            row.pack_start(b, False, False, 0)
+            def on_pick(_w: Gtk.Widget, idx: int = state.index, heater: str = state.heater_name) -> None:
+                popup.destroy()
+                self._show_pid_temp(idx, heater)
 
-        inner.pack_start(row, True, True, 0)
-        inner.pack_start(button("BACK", "tc-btn-global", lambda _w: (popup.destroy(), self._show_settings(None))), False, False, 0)
+            card_button = Gtk.Button()
+            card_button.set_relief(Gtk.ReliefStyle.NONE)
+            card_button.get_style_context().add_class("tc-popup-flat-btn")
+            card_button.set_size_request(205, 190)
+            card_button.connect("clicked", on_pick)
 
-        popup.add(inner)
+            card = box(spacing=7)
+            card.set_halign(Gtk.Align.CENTER)
+            card.set_valign(Gtk.Align.CENTER)
+            card.set_size_request(120, 160)
+            card.set_margin_top(10)
+            card.set_margin_bottom(10)
+            card.set_margin_start(10)
+            card.set_margin_end(10)
+
+            card_ctx = card.get_style_context()
+            if state.active:
+                card_ctx.add_class("tc-popup-card-active")
+            else:
+                card_ctx.add_class("tc-popup-card")
+
+            tool_label = Gtk.Label(label=f"T{state.index}")
+            tool_label.get_style_context().add_class("tc-popup-card-title")
+            tool_label.set_xalign(0.5)
+            tool_label.set_justify(Gtk.Justification.CENTER)
+            card.pack_start(tool_label, False, False, 0)
+
+            spool_logo = Gtk.DrawingArea()
+            spool_logo.set_size_request(52, 52)
+
+            def draw_mini_spool(widget: Gtk.DrawingArea, cr: cairo.Context, s: ToolState = state) -> bool:
+                w = widget.get_allocated_width()
+                h = widget.get_allocated_height()
+                cx = w / 2.0
+                cy = h / 2.0
+                outer_r = 16
+                inner_r = 9
+                hub_r = 4
+                color = normalize_hex(s.color_hex if s.spool_id else "#4a5675")
+                r, g, b = hex_to_rgb01(color)
+
+                cr.set_source_rgba(1, 1, 1, 0.08)
+                cr.set_line_width(8)
+                cr.arc(cx, cy, (outer_r + inner_r) / 2.0, 0, 2 * math.pi)
+                cr.stroke()
+
+                grad = cairo.LinearGradient(cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r)
+                grad.add_color_stop_rgb(0.0, min(1, r * 1.08 + 0.06), min(1, g * 1.08 + 0.06), min(1, b * 1.08 + 0.06))
+                grad.add_color_stop_rgb(1.0, max(0, r * 0.55), max(0, g * 0.55), max(0, b * 0.55))
+                cr.set_source(grad)
+                cr.set_line_width(7)
+                cr.arc(cx, cy, (outer_r + inner_r) / 2.0, 0, 2 * math.pi)
+                cr.stroke()
+
+                cr.set_source_rgba(0.15, 0.20, 0.32, 1.0)
+                cr.arc(cx, cy, inner_r, 0, 2 * math.pi)
+                cr.fill()
+
+                cr.set_source_rgba(1, 1, 1, 0.30)
+                cr.set_line_width(1.2)
+                cr.arc(cx, cy, outer_r, -1.9, -0.8)
+                cr.stroke()
+
+                cr.set_source_rgba(1, 1, 1, 0.22)
+                cr.set_line_width(1.0)
+                cr.arc(cx, cy, hub_r, 0, 2 * math.pi)
+                cr.stroke()
+
+                return False
+
+            spool_logo.connect("draw", draw_mini_spool)
+            card.pack_start(spool_logo, False, False, 0)
+
+            filament = Gtk.Label(label=state.material if state.spool_id else "EMPTY")
+            filament.get_style_context().add_class("tc-popup-card-sub")
+            filament.set_xalign(0.5)
+            filament.set_justify(Gtk.Justification.CENTER)
+            filament.set_line_wrap(True)
+            card.pack_start(filament, False, False, 0)
+
+            temp = Gtk.Label(label=f"{state.temperature:.0f}C")
+            temp.get_style_context().add_class("tc-popup-card-temp")
+            temp.set_xalign(0.5)
+            temp.set_justify(Gtk.Justification.CENTER)
+            card.pack_start(temp, False, False, 0)
+
+            card_button.add(card)
+            cards_row.pack_start(card_button, False, False, 0)
+
+        outer.pack_start(cards_row, True, True, 0)
+
+        footer = box(Gtk.Orientation.HORIZONTAL, 10)
+        footer.set_halign(Gtk.Align.CENTER)
+
+        back = button("BACK", "tc-btn-global", lambda _w: (popup.destroy(), self._show_settings(None)))
+        back.set_size_request(160, 42)
+        cancel = button("CANCEL", "tc-btn-global", lambda _w: popup.destroy())
+        cancel.set_size_request(160, 42)
+        footer.pack_start(back, False, False, 0)
+        footer.pack_start(cancel, False, False, 0)
+
+        outer.pack_start(footer, False, False, 0)
+
+        popup.add(outer)
         popup.show_all()
 
-    def _show_pid_temp(self, heater_name: str) -> None:
+    def _show_pid_temp(self, tool_index: int, heater_name: str) -> None:
         popup = self._register_popup(popup_window(self._screen))
 
-        layout = box(Gtk.Orientation.HORIZONTAL, 20)
-        layout.get_style_context().add_class("tc-popup")
-        layout.set_size_request(320, 360)
-        layout.set_margin_top(15)
-        layout.set_margin_bottom(15)
-        layout.set_margin_start(15)
-        layout.set_margin_end(15)
+        outer = box(spacing=14)
+        outer.get_style_context().add_class("tc-popup")
+        outer.set_size_request(640, 430)
+        outer.set_margin_top(15)
+        outer.set_margin_bottom(15)
+        outer.set_margin_start(15)
+        outer.set_margin_end(15)
+
+        top = box(Gtk.Orientation.HORIZONTAL, 20)
 
         default = 200
-        value_label = Gtk.Label(label=f"{default} C")
-        value_label.get_style_context().add_class("tc-temp-label")
+        value_state = {"text": str(default), "replace": True}
+        slider_guard = {"active": False}
 
-        adjustment = Gtk.Adjustment(value=default, lower=0, upper=310, step_increment=1, page_increment=10)
-        slider = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL, adjustment=adjustment)
-        slider.set_inverted(True)
-        slider.set_vexpand(True)
-        slider.set_draw_value(False)
-        slider.connect("value-changed", lambda s: value_label.set_text(f"{int(s.get_value())} C"))
+        temp_value_label = Gtk.Label(label=f"{default} C")
+        temp_value_label.get_style_context().add_class("tc-temp-label")
 
-        left = box(spacing=10)
-        left.pack_start(value_label, False, False, 0)
-        left.pack_start(slider, True, True, 0)
-        layout.pack_start(left, True, True, 0)
+        temp_adjustment = Gtk.Adjustment(value=default, lower=0, upper=310, step_increment=1, page_increment=10)
+        temp_slider = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL, adjustment=temp_adjustment)
+        temp_slider.set_inverted(True)
+        temp_slider.set_vexpand(True)
+        temp_slider.set_draw_value(False)
+        temp_slider.set_size_request(70, 240)
 
-        controls = box(spacing=12)
-        run = button(
-            "RUN PID",
-            "tc-btn-select",
-            lambda _w: (self._queue_gcode(f"PID_TUNE HEATER={heater_name} TARGET={int(slider.get_value())}"), popup.destroy()),
+        def apply_temp_value(value: int, replace_next: bool = False) -> None:
+            clamped = max(0, min(310, int(value)))
+            value_state["text"] = str(clamped)
+            value_state["replace"] = replace_next
+            temp_value_label.set_text(f"{clamped} C")
+            if int(round(temp_slider.get_value())) != clamped:
+                slider_guard["active"] = True
+                temp_slider.set_value(clamped)
+                slider_guard["active"] = False
+
+        def on_temp_slider_changed(scale: Gtk.Scale) -> None:
+            if slider_guard["active"]:
+                return
+            apply_temp_value(int(round(scale.get_value())), replace_next=True)
+
+        temp_slider.connect("value-changed", on_temp_slider_changed)
+
+        fan_adjustment = Gtk.Adjustment(value=100, lower=0, upper=100, step_increment=1, page_increment=10)
+        fan_slider = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL, adjustment=fan_adjustment)
+        fan_slider.set_inverted(True)
+        fan_slider.set_vexpand(True)
+        fan_slider.set_draw_value(False)
+        fan_slider.set_size_request(70, 240)
+
+        fan_percent_label = Gtk.Label(label="100%")
+        fan_percent_label.get_style_context().add_class("tc-temp-label")
+
+        left = box(spacing=8)
+        left.set_size_request(190, -1)
+
+        fan_title = Gtk.Label(label=f"PART COOLING FAN - T{tool_index}")
+        fan_title.get_style_context().add_class("tc-mat-label")
+        fan_title.set_xalign(0)
+        left.pack_start(fan_title, False, False, 0)
+
+        fan_toggle_row = box(Gtk.Orientation.HORIZONTAL, 8)
+        fan_toggle_label = Gtk.Label(label="Use during PID")
+        fan_toggle_label.get_style_context().add_class("tc-mat-label-empty")
+        fan_toggle_label.set_xalign(0)
+
+        fan_enable = Gtk.Switch()
+        fan_enable.set_active(False)
+
+        fan_toggle_row.pack_start(fan_toggle_label, True, True, 0)
+        fan_toggle_row.pack_end(fan_enable, False, False, 0)
+        left.pack_start(fan_toggle_row, False, False, 0)
+
+        fan_level_label = Gtk.Label(label="Fan level")
+        fan_level_label.get_style_context().add_class("tc-mat-label-empty")
+        fan_level_label.set_xalign(0)
+        left.pack_start(fan_level_label, False, False, 6)
+
+        fan_live_label = Gtk.Label(label="100%")
+        fan_live_label.get_style_context().add_class("tc-mat-label")
+        fan_live_label.set_xalign(0)
+        left.pack_start(fan_live_label, False, False, 0)
+
+        def update_fan_labels(scale: Gtk.Scale) -> None:
+            text = f"{int(round(scale.get_value()))}%"
+            fan_live_label.set_text(text)
+            fan_percent_label.set_text(text)
+
+        fan_slider.connect("value-changed", update_fan_labels)
+
+        fan_presets = box(Gtk.Orientation.HORIZONTAL, 6)
+        preset_buttons = []
+
+        def set_fan_percent(value: int) -> None:
+            fan_slider.set_value(value)
+
+        for pct in (0, 25, 50, 75, 100):
+            label = "OFF" if pct == 0 else f"{pct}%"
+            preset = button(label, "tc-btn-global", lambda _w, p=pct: set_fan_percent(p))
+            preset.set_size_request(58, 38)
+            fan_presets.pack_start(preset, False, False, 0)
+            preset_buttons.append(preset)
+
+        left.pack_start(fan_presets, False, False, 0)
+
+        center = box(Gtk.Orientation.HORIZONTAL, 20)
+        center.set_hexpand(True)
+        center.set_halign(Gtk.Align.CENTER)
+
+        fan_box = box(spacing=8)
+        fan_box.set_halign(Gtk.Align.CENTER)
+        fan_box.pack_start(fan_percent_label, False, False, 0)
+        fan_box.pack_start(fan_slider, True, True, 0)
+
+        temp_box = box(spacing=8)
+        temp_box.set_halign(Gtk.Align.CENTER)
+        temp_box.pack_start(temp_value_label, False, False, 0)
+        temp_box.pack_start(temp_slider, True, True, 0)
+
+        center.pack_start(fan_box, False, False, 0)
+        center.pack_start(temp_box, False, False, 0)
+
+        right = box(spacing=10)
+        right.set_size_request(250, -1)
+
+        keypad_grid = Gtk.Grid()
+        keypad_grid.set_row_spacing(8)
+        keypad_grid.set_column_spacing(8)
+        keypad_grid.set_halign(Gtk.Align.CENTER)
+
+        def append_digit(digit: str) -> None:
+            if value_state["replace"]:
+                candidate = digit
+            else:
+                candidate = f"{value_state['text']}{digit}"
+            candidate = candidate.lstrip("0") or "0"
+            apply_temp_value(int(candidate), replace_next=False)
+
+        def clear_value() -> None:
+            apply_temp_value(0, replace_next=True)
+
+        def backspace_value() -> None:
+            if value_state["replace"]:
+                apply_temp_value(0, replace_next=True)
+                return
+            candidate = value_state["text"][:-1]
+            if not candidate:
+                apply_temp_value(0, replace_next=True)
+                return
+            apply_temp_value(int(candidate), replace_next=False)
+
+        keypad_buttons = [
+            ("7", lambda _w: append_digit("7")),
+            ("8", lambda _w: append_digit("8")),
+            ("9", lambda _w: append_digit("9")),
+            ("4", lambda _w: append_digit("4")),
+            ("5", lambda _w: append_digit("5")),
+            ("6", lambda _w: append_digit("6")),
+            ("1", lambda _w: append_digit("1")),
+            ("2", lambda _w: append_digit("2")),
+            ("3", lambda _w: append_digit("3")),
+            ("CLR", lambda _w: clear_value()),
+            ("0", lambda _w: append_digit("0")),
+            ("DEL", lambda _w: backspace_value()),
+        ]
+
+        for idx, (label, callback) in enumerate(keypad_buttons):
+            row, col = divmod(idx, 3)
+            key = button(label, "tc-btn-global", callback)
+            key.set_size_request(74, 54)
+            keypad_grid.attach(key, col, row, 1, 1)
+
+        right.pack_start(keypad_grid, False, False, 0)
+
+        def update_fan_controls(*_args) -> None:
+            enabled = fan_enable.get_active()
+            fan_level_label.set_sensitive(enabled)
+            fan_live_label.set_sensitive(enabled)
+            fan_percent_label.set_sensitive(enabled)
+            fan_slider.set_sensitive(enabled)
+            for btn in preset_buttons:
+                btn.set_sensitive(enabled)
+
+        fan_enable.connect("notify::active", update_fan_controls)
+        update_fan_controls()
+
+        top.pack_start(left, False, False, 0)
+        top.pack_start(center, True, True, 0)
+        top.pack_start(right, False, False, 0)
+
+        outer.pack_start(top, True, True, 0)
+
+        def build_pid_command() -> str:
+            commands = []
+
+            if fan_enable.get_active():
+                fan_percent = int(round(fan_slider.get_value()))
+                fan_speed = max(0.0, min(1.0, fan_percent / 100.0))
+                fan_name = f"t{tool_index}_partfan"
+                commands.append(f"SET_FAN_SPEED FAN={fan_name} SPEED={fan_speed:.2f}")
+
+            commands.append(f"PID_TUNE HEATER={heater_name} TARGET={int(temp_slider.get_value())}")
+            return "\n".join(commands)
+
+        def run_pid(_w: Gtk.Widget) -> None:
+            if tool_index >= len(self._tool_states):
+                self._show_message("Selected tool is no longer available")
+                return
+
+            command = build_pid_command()
+            state = self._tool_states[tool_index]
+
+            if state.ktc_state == "changing":
+                self._show_message("Tool change already in progress")
+                return
+
+            if state.ktc_state == "error":
+                self._show_message(f"T{tool_index} is in error state")
+                return
+
+            if state.active or state.ktc_state == "active":
+                self._start_pid_tune_command(tool_index, command)
+                popup.destroy()
+                return
+
+            if self._request_tool_activation(tool_index, require_spool=False, notify_if_active=False):
+                self._wait_for_tool_active_then_pid(tool_index, command)
+                popup.destroy()
+
+        bottom = box(Gtk.Orientation.HORIZONTAL, 12)
+        bottom.set_halign(Gtk.Align.CENTER)
+
+        back_btn = button(
+            "BACK",
+            "tc-btn-global",
+            lambda _w: (popup.destroy(), self._show_pid_select()),
         )
-        run.set_size_request(110, 58)
+        back_btn.set_size_request(120, 48)
 
-        cancel = button("CANCEL", "tc-btn-global", lambda _w: popup.destroy())
-        cancel.set_size_request(110, 48)
+        cancel_btn = button("CANCEL", "tc-btn-global", lambda _w: popup.destroy())
+        cancel_btn.set_size_request(120, 48)
 
-        controls.pack_start(run, False, False, 0)
-        controls.pack_end(cancel, False, False, 0)
-        layout.pack_start(controls, False, False, 0)
+        run_btn = button("RUN PID", "tc-btn-select", run_pid)
+        run_btn.set_size_request(170, 58)
 
-        popup.add(layout)
+        bottom.pack_start(back_btn, False, False, 0)
+        bottom.pack_start(cancel_btn, False, False, 0)
+        bottom.pack_start(run_btn, False, False, 0)
+
+        outer.pack_start(bottom, False, False, 0)
+
+        popup.add(outer)
         popup.show_all()
 
     def _show_theme(self) -> None:
