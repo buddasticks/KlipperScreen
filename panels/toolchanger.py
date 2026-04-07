@@ -96,6 +96,10 @@ def luminance(color: str) -> float:
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
+def readable_text_color(color: str, light: str = "#ffffff", dark: str = "#111111") -> str:
+    return dark if luminance(color) > 0.50 else light
+
+
 def hex_to_gdk(color: str) -> Gdk.RGBA:
     r, g, b = hex_to_rgb01(color)
     return Gdk.RGBA(r, g, b, 1.0)
@@ -189,6 +193,9 @@ def derive_theme_fields(base: Dict[str, str]) -> Dict[str, str]:
     bar_bg = normalize_hex(base["bar_bg"])
     btn_bg = normalize_hex(base["btn_bg"])
 
+    load_bg = mix_colors(accent, "#26d17d", 0.25)
+    unload_bg = mix_colors(accent, "#ff5c5c", 0.35)
+
     return {
         "bg": bg,
         "card": card,
@@ -204,6 +211,16 @@ def derive_theme_fields(base: Dict[str, str]) -> Dict[str, str]:
         "danger": "#ff4d4f",
         "ok": "#12d67a",
         "muted": mix_colors(text, bg, 0.55),
+        "load_bg": load_bg,
+        "load_bg_hover": mix_colors(load_bg, "#ffffff", 0.10),
+        "load_bg_active": adjust_color(load_bg, 0.86),
+        "load_border": mix_colors(load_bg, "#ffffff", 0.20),
+        "load_text": readable_text_color(load_bg),
+        "unload_bg": unload_bg,
+        "unload_bg_hover": mix_colors(unload_bg, "#ffffff", 0.08),
+        "unload_bg_active": adjust_color(unload_bg, 0.84),
+        "unload_border": mix_colors(unload_bg, "#ffffff", 0.16),
+        "unload_text": readable_text_color(unload_bg),
     }
 
 
@@ -221,11 +238,21 @@ def make_css(theme: Dict[str, str]) -> bytes:
 .tc-card-active {{ background-color: {theme['card']}; border-radius: 14px; border: 3px solid {accent}; }}
 .tc-tool-label {{ color: {accent}; font-size: 18px; font-weight: 800; }}
 .tc-mat-label {{ color: {theme['text']}; font-size: 16px; font-weight: 800; }}
-.tc-mat-label-empty {{ color: {theme['text']}; font-size: 16px; font-weight: 800; }}
+.tc-mat-label-empty {{ color: {theme['muted']}; font-size: 16px; font-weight: 800; }}
 .tc-temp-label {{ color: {theme['text']}; font-size: 26px; font-weight: 800; padding: 4px; }}
 .tc-bottom-bar {{ background-color: {theme['bar_bg']}; border-top: 1px solid {theme['card_border']}; }}
 .tc-btn-global {{ background: {theme['btn_bg']}; color: {theme['text']}; border-radius: 8px; font-size: 12px; font-weight: 700; border: 1px solid {theme['btn_border']}; }}
+.tc-btn-global:hover {{ background: {mix_colors(theme['btn_bg'], "#ffffff", 0.10)}; }}
+.tc-btn-global:active {{ background: {adjust_color(theme['btn_bg'], 0.86)}; }}
 .tc-btn-select {{ background: {accent_dark}; color: {btn_text}; border-radius: 8px; font-size: 12px; font-weight: 800; border: 1px solid {accent}; }}
+.tc-btn-select:hover {{ background: {mix_colors(accent_dark, "#ffffff", 0.14)}; }}
+.tc-btn-select:active {{ background: {adjust_color(accent_dark, 0.82)}; }}
+.tc-btn-load {{ background: {theme['load_bg']}; color: {theme['load_text']}; border-radius: 8px; font-size: 12px; font-weight: 900; border: 1px solid {theme['load_border']}; }}
+.tc-btn-load:hover {{ background: {theme['load_bg_hover']}; }}
+.tc-btn-load:active {{ background: {theme['load_bg_active']}; }}
+.tc-btn-unload {{ background: {theme['unload_bg']}; color: {theme['unload_text']}; border-radius: 8px; font-size: 12px; font-weight: 900; border: 1px solid {theme['unload_border']}; }}
+.tc-btn-unload:hover {{ background: {theme['unload_bg_hover']}; }}
+.tc-btn-unload:active {{ background: {theme['unload_bg_active']}; }}
 .tc-badge-active {{ background-color: #003a20; color: #00ff88; border-radius: 6px; font-size: 11px; font-weight: 800; padding: 2px 8px; border: 1px solid #00cc66; }}
 .tc-badge-heating {{ background-color: #3f2700; color: #ffbf40; border-radius: 6px; font-size: 11px; font-weight: 800; padding: 2px 8px; border: 1px solid #ffb020; }}
 .tc-badge-parked {{ background-color: {theme['btn_bg']}; color: {theme['text']}; border-radius: 6px; font-size: 11px; font-weight: 800; padding: 2px 8px; border: 1px solid {theme['btn_border']}; }}
@@ -240,6 +267,7 @@ def make_css(theme: Dict[str, str]) -> bytes:
 .tc-popup-card-sub {{ color: {theme['muted']}; font-size: 11px; font-weight: 700; }}
 .tc-popup-card-temp {{ color: {accent}; font-size: 20px; font-weight: 900; }}
 .tc-settings-meta {{ color: {theme['muted']}; font-size: 11px; font-weight: 700; }}
+.tc-popup-text {{ color: {theme['text']}; font-size: 16px; font-weight: 700; }}
 .tc-popup-flat-btn, .tc-popup-flat-btn:hover, .tc-popup-flat-btn:active, .tc-popup-flat-btn:checked {{ background: transparent; background-image: none; border: none; box-shadow: none; padding: 0; }}
 """
     return css.encode("utf-8")
@@ -946,6 +974,13 @@ class ToolchangerPanel:
                 f"{state.temperature:.0f}C" + (f" / {state.target:.0f}" if state.target > 0 else "")
             )
             widgets.mat.set_text(state.material)
+            mat_ctx = widgets.mat.get_style_context()
+            if state.material == "EMPTY":
+                mat_ctx.add_class("tc-mat-label-empty")
+                mat_ctx.remove_class("tc-mat-label")
+            else:
+                mat_ctx.add_class("tc-mat-label")
+                mat_ctx.remove_class("tc-mat-label-empty")
 
             frame_ctx = widgets.frame.get_style_context()
             if state.active:
@@ -1117,6 +1152,7 @@ class ToolchangerPanel:
         layout.set_margin_end(20)
 
         label = Gtk.Label(label=text)
+        label.get_style_context().add_class("tc-popup-text")
         layout.pack_start(label, True, True, 0)
 
         btn = button("OK", "tc-btn-select", lambda _w: popup.destroy())
@@ -1136,6 +1172,7 @@ class ToolchangerPanel:
         layout.set_margin_end(20)
 
         label = Gtk.Label(label=text)
+        label.get_style_context().add_class("tc-popup-text")
         label.set_line_wrap(True)
         label.set_justify(Gtk.Justification.CENTER)
         layout.pack_start(label, True, True, 0)
