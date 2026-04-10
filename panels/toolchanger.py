@@ -395,3 +395,4 @@ class ToolchangerPanel:
         self._start_polling_worker()
 
     # ... content omitted for brevity ...
+Panel = ToolchangerPanel
