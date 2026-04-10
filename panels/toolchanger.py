@@ -571,7 +571,7 @@ class ToolchangerPanel:
             self._make_longpress_button(
                 "LOAD",
                 "tc-btn-load",
-                lambda idx=state.index: self._run_tool_filament_action(idx, "LOAD_FILAMENT"),
+                lambda idx=state.index: self._show_filament_temp_popup(idx, "LOAD_FILAMENT", "Load"),
             ),
             False,
             False,
@@ -581,7 +581,7 @@ class ToolchangerPanel:
             self._make_longpress_button(
                 "UNLOAD",
                 "tc-btn-unload",
-                lambda idx=state.index: self._run_tool_filament_action(idx, "UNLOAD_FILAMENT"),
+                lambda idx=state.index: self._show_filament_temp_popup(idx, "UNLOAD_FILAMENT", "Unload"),
             ),
             False,
             False,
@@ -1153,9 +1153,13 @@ class ToolchangerPanel:
 
         GLib.timeout_add(250, poll)
 
-    def _run_tool_filament_action(self, tool_index: int, action_name: str) -> None:
+    def _run_tool_filament_action(self, tool_index: int, action_name: str, temperature: Optional[int] = None) -> None:
         state = self._tool_states[tool_index]
-        command = f"{action_name} TOOL={tool_index}"
+
+        if temperature is None:
+            temperature = int(round(state.target)) if state.target > 0 else 220
+
+        action_command = f"{action_name} TOOL={tool_index} TEMP={int(temperature)}"
 
         if state.ktc_state == "changing":
             self._show_message("Tool change already in progress")
@@ -1165,12 +1169,42 @@ class ToolchangerPanel:
             self._show_message(f"T{tool_index} is in error state")
             return
 
+        def run_after_active() -> None:
+            self._queue_gcode(action_command)
+
         if state.active or state.ktc_state == "active":
-            self._queue_gcode(command)
+            run_after_active()
             return
 
         if self._request_tool_activation(tool_index, require_spool=False, notify_if_active=False):
-            self._wait_for_tool_active_then_run(tool_index, command)
+            self._wait_for_tool_active_then_callback(tool_index, run_after_active)
+
+    def _wait_for_tool_active_then_callback(self, tool_index: int, callback: Callable[[], None]) -> None:
+        attempts = {"count": 0}
+        max_attempts = 40
+
+        def poll() -> bool:
+            if tool_index >= len(self._tool_states):
+                return False
+
+            state = self._tool_states[tool_index]
+
+            if state.ktc_state == "error":
+                self._show_message(f"T{tool_index} entered an error state")
+                return False
+
+            if state.active or state.ktc_state == "active":
+                callback()
+                return False
+
+            attempts["count"] += 1
+            if attempts["count"] >= max_attempts:
+                self._show_message(f"T{tool_index} did not become active in time")
+                return False
+
+            return True
+
+        GLib.timeout_add(250, poll)
 
     def _select_tool(self, tool_index: int) -> None:
         self._request_tool_activation(tool_index, require_spool=True, notify_if_active=True)
@@ -1238,6 +1272,133 @@ class ToolchangerPanel:
     # ------------------------------------------------------------------
     # Popups
     # ------------------------------------------------------------------
+
+    def _show_filament_temp_popup(self, tool_index: int, action_name: str, action_label: str) -> None:
+        state = self._tool_states[tool_index]
+        popup = self._register_popup(popup_window(self._screen))
+
+        layout = box(Gtk.Orientation.HORIZONTAL, 18)
+        layout.get_style_context().add_class("tc-popup")
+        layout.set_size_request(520, 400)
+        layout.set_margin_top(15)
+        layout.set_margin_bottom(15)
+        layout.set_margin_start(15)
+        layout.set_margin_end(15)
+
+        default_temp = int(round(state.target)) if state.target > 0 else 220
+        current_value = max(0, min(310, default_temp))
+        value_state = {"text": str(current_value), "replace": True}
+        slider_guard = {"active": False}
+
+        value_label = Gtk.Label(label=f"{current_value} C")
+        value_label.get_style_context().add_class("tc-temp-label")
+
+        subtitle = Gtk.Label(label=f"{action_label} temperature for T{tool_index}")
+        subtitle.get_style_context().add_class("tc-popup-subtitle")
+
+        adjustment = Gtk.Adjustment(value=current_value, lower=0, upper=310, step_increment=1, page_increment=10)
+        slider = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL, adjustment=adjustment)
+        slider.set_inverted(True)
+        slider.set_vexpand(True)
+        slider.set_draw_value(False)
+
+        def apply_value(value: int, replace_next: bool = False) -> None:
+            clamped = max(0, min(310, int(value)))
+            value_state["text"] = str(clamped)
+            value_state["replace"] = replace_next
+            value_label.set_text(f"{clamped} C")
+            if int(round(slider.get_value())) != clamped:
+                slider_guard["active"] = True
+                slider.set_value(clamped)
+                slider_guard["active"] = False
+
+        def on_slider_changed(scale: Gtk.Scale) -> None:
+            if slider_guard["active"]:
+                return
+            apply_value(int(round(scale.get_value())), replace_next=True)
+
+        slider.connect("value-changed", on_slider_changed)
+
+        slider_box = box(spacing=10)
+        slider_box.set_hexpand(True)
+        slider_box.pack_start(subtitle, False, False, 0)
+        slider_box.pack_start(value_label, False, False, 0)
+        slider_box.pack_start(slider, True, True, 0)
+        layout.pack_start(slider_box, True, True, 0)
+
+        keypad_wrap = box(spacing=10)
+        keypad_wrap.set_hexpand(True)
+
+        keypad_grid = Gtk.Grid()
+        keypad_grid.set_row_spacing(8)
+        keypad_grid.set_column_spacing(8)
+        keypad_grid.set_halign(Gtk.Align.CENTER)
+
+        def append_digit(digit: str) -> None:
+            if value_state["replace"]:
+                candidate = digit
+            else:
+                candidate = f"{value_state['text']}{digit}"
+            candidate = candidate.lstrip("0") or "0"
+            apply_value(int(candidate), replace_next=False)
+
+        def clear_value() -> None:
+            apply_value(0, replace_next=True)
+
+        def backspace_value() -> None:
+            if value_state["replace"]:
+                apply_value(0, replace_next=True)
+                return
+            candidate = value_state["text"][:-1]
+            if not candidate:
+                apply_value(0, replace_next=True)
+                return
+            apply_value(int(candidate), replace_next=False)
+
+        keypad_buttons = [
+            ("7", lambda _w: append_digit("7")),
+            ("8", lambda _w: append_digit("8")),
+            ("9", lambda _w: append_digit("9")),
+            ("4", lambda _w: append_digit("4")),
+            ("5", lambda _w: append_digit("5")),
+            ("6", lambda _w: append_digit("6")),
+            ("1", lambda _w: append_digit("1")),
+            ("2", lambda _w: append_digit("2")),
+            ("3", lambda _w: append_digit("3")),
+            ("CLR", lambda _w: clear_value()),
+            ("0", lambda _w: append_digit("0")),
+            ("DEL", lambda _w: backspace_value()),
+        ]
+
+        for idx, (label, callback) in enumerate(keypad_buttons):
+            row, col = divmod(idx, 3)
+            key = button(label, "tc-btn-global", callback)
+            key.set_size_request(74, 54)
+            keypad_grid.attach(key, col, row, 1, 1)
+
+        keypad_wrap.pack_start(keypad_grid, False, False, 0)
+
+        def confirm_action() -> None:
+            temp = int(slider.get_value())
+            popup.destroy()
+            self._run_tool_filament_action(tool_index, action_name, temp)
+
+        actions = box(spacing=10)
+
+        start_btn = button(action_label.upper(), "tc-btn-select", lambda _w: confirm_action())
+        start_btn.set_size_request(150, 58)
+
+        close_btn = button("CLOSE", "tc-btn-global", lambda _w: popup.destroy())
+        close_btn.set_size_request(150, 48)
+
+        actions.pack_start(start_btn, False, False, 0)
+        actions.pack_start(close_btn, False, False, 0)
+
+        keypad_wrap.pack_start(actions, False, False, 0)
+        layout.pack_start(keypad_wrap, False, False, 0)
+
+        popup.add(layout)
+        popup.show_all()
 
     def _show_temp_popup(self, tool_index: int) -> None:
         state = self._tool_states[tool_index]
