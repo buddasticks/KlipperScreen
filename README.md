@@ -22,6 +22,7 @@ The `toolchanger-ui` branch includes:
 - automatic tool pickup before load, unload, and PID tune actions when required
 - card-style tool selection popups for both normal tool selection and PID tune selection
 - numeric keypad entry for tool temperature and PID temperature popups
+- long-press **LOAD** and **UNLOAD** actions that open a temperature picker before running the filament macro
 - optional per-tool part-cooling fan control during PID tuning
 
 ### Assumptions and requirements
@@ -45,20 +46,23 @@ The toolchanger panel uses these commands:
 
 - `T0`, `T1`, `T2`, `T3`, ... to select a tool
 - `UNSELECT_TOOL` to drop the current tool
-- `LOAD_FILAMENT TOOL=<n>` to load filament for a specific tool
-- `UNLOAD_FILAMENT TOOL=<n>` to unload filament for a specific tool
+- `LOAD_FILAMENT TOOL=<n> TEMP=<temp>` to load filament for a specific tool at the selected popup temperature
+- `UNLOAD_FILAMENT TOOL=<n> TEMP=<temp>` to unload filament for a specific tool at the selected popup temperature
 - `PID_TUNE HEATER=<heater> TARGET=<temp>` from the settings popup
 
  
 - The PID popup can optionally enable the selected tool's part-cooling fan before running PID tune.
 - The current panel implementation expects per-tool part-cooling fans to be named like `t0_partfan`, `t1_partfan`, `t2_partfan`, etc.
 - If your printer uses different fan names, adjust the panel code accordingly.
+- LOAD and UNLOAD are triggered by a long-press on the tool card buttons.
+- After the long-press completes, the UI opens a temperature popup.
+- The selected popup temperature is forwarded to the printer macros as `TEMP=<value>`.
 
 Each `Tn` macro must expose `variable_spool_id`, because KlipperScreen writes spool assignments into the macro with `SET_GCODE_VARIABLE MACRO=Tn VARIABLE=spool_id VALUE=...`.
 
 ### Notes
 
-- The `LOAD_FILAMENT` and `UNLOAD_FILAMENT` wrappers below are important. The panel sends `TOOL=<n>`, so these macros should honor that parameter.
+- The `LOAD_FILAMENT` and `UNLOAD_FILAMENT` wrappers below are important. The panel sends `TOOL=<n>` and forwards `TEMP=<selected_temp>`, so these macros should honor both parameters.
 - Spool assignment support also expects `[save_variables]`, Moonraker toolchanger objects, and Spoolman to be configured.
 - `job_status.py` can also use `Z_OFFSET_APPLY_PROBE` and `Z_OFFSET_APPLY_ENDSTOP` for its save-Z buttons, but those are optional and are not required for the main toolchanger panel.
 - Duplicate the `Tn` pattern below for however many tools your machine uses.
@@ -256,12 +260,13 @@ gcode:
 
 # ------------------------------------------------------------------------------
 # FILAMENT LOAD / UNLOAD WRAPPERS
-# The UI calls LOAD_FILAMENT TOOL=n and UNLOAD_FILAMENT TOOL=n.
-# These wrappers forward to the per-tool implementations.
+# The UI calls LOAD_FILAMENT TOOL=n TEMP=<selected_temp> and
+# UNLOAD_FILAMENT TOOL=n TEMP=<selected_temp>.
+# These wrappers forward both values to the per-tool implementations.
 # ------------------------------------------------------------------------------
 
 [gcode_macro LOAD_FILAMENT]
-description: UI-facing wrapper - load filament for TOOL=<n>; forwards to LOAD_ONE_FILAMENT
+description: UI-facing wrapper - load filament for TOOL=<n> and optional TEMP=<temp>; forwards to LOAD_ONE_FILAMENT
 gcode:
   {% if 'TOOL' not in params %}
     RESPOND TYPE=error MSG="TOOL parameter required! Usage: LOAD_FILAMENT TOOL=0"
@@ -277,7 +282,7 @@ gcode:
   {% endif %}
 
 [gcode_macro UNLOAD_FILAMENT]
-description: UI-facing wrapper - unload filament for TOOL=<n>; forwards to UNLOAD_ONE_FILAMENT
+description: UI-facing wrapper - unload filament for TOOL=<n> and optional TEMP=<temp>; forwards to UNLOAD_ONE_FILAMENT
 gcode:
   {% if 'TOOL' not in params %}
     RESPOND TYPE=error MSG="TOOL parameter required! Usage: UNLOAD_FILAMENT TOOL=0"
