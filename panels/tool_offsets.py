@@ -101,34 +101,62 @@ class Panel(ScreenPanel):
 
         self.apply_css()
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12
+        )
+        root.get_style_context().add_class("to-root")
+
         root.set_margin_start(14)
         root.set_margin_end(14)
         root.set_margin_top(14)
         root.set_margin_bottom(14)
 
         title = Gtk.Label(label="TOOL OFFSET DASHBOARD")
-        title.get_style_context().add_class("title")
+        title.get_style_context().add_class("to-dashboard-title")
         title.set_xalign(0)
 
         root.pack_start(title, False, False, 0)
 
+        # --------------------------------------------------------
+        # SCROLL AREA
+        # --------------------------------------------------------
+
         scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        scroll.set_policy(
+            Gtk.PolicyType.AUTOMATIC,
+            Gtk.PolicyType.AUTOMATIC
+        )
 
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+        scroll.set_vexpand(True)
 
-        for tool in self.tools.keys():
-            row.pack_start(self.build_tool_tile(tool), False, False, 0)
+        grid = Gtk.Grid()
+        grid.set_row_spacing(14)
+        grid.set_column_spacing(15)
+        grid.set_halign(Gtk.Align.CENTER)
+        grid.set_valign(Gtk.Align.CENTER)
 
-        scroll.add(row)
+        for i, tool in enumerate(self.tools.keys()):
+
+            tile = self.build_tool_tile(tool)
+
+            grid.attach(tile, i, 0, 1, 1)
+
+        scroll.add(grid)
 
         root.pack_start(scroll, True, True, 0)
 
+        # --------------------------------------------------------
+        # FIXED BOTTOM BUTTON
+        # --------------------------------------------------------
+
         apply_btn = Gtk.Button(label="Apply Changes")
+        apply_btn.set_size_request(-1, 60)
+        apply_btn.get_style_context().add_class("to-apply")
+
         apply_btn.connect("clicked", self.on_apply)
 
-        root.pack_start(apply_btn, False, False, 10)
+        root.pack_end(apply_btn, False, False, 0)
 
         self.content.add(root)
         self.content.show_all()
@@ -145,10 +173,15 @@ class Panel(ScreenPanel):
         self.buttons.setdefault(tool, {})
 
         tile = Gtk.EventBox()
-        tile.get_style_context().add_class("card")
-        tile.set_size_request(260, -1)
+        tile.get_style_context().add_class("to-card")
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        tile.set_size_request(185, -1)
+
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=10
+        )
+
         box.set_margin_start(12)
         box.set_margin_end(12)
         box.set_margin_top(12)
@@ -156,15 +189,33 @@ class Panel(ScreenPanel):
 
         header = Gtk.Label(label=tool)
         header.set_xalign(0)
-        header.get_style_context().add_class("title")
+        header.get_style_context().add_class("to-tool-title")
 
         box.pack_start(header, False, False, 0)
 
-        box.pack_start(self.axis_row(tool, "x", data["x"]), False, False, 0)
-        box.pack_start(self.axis_row(tool, "y", data["y"]), False, False, 0)
-        box.pack_start(self.axis_row(tool, "z", data["z"]), False, False, 0)
+        box.pack_start(
+            self.axis_row(tool, "x", data["x"]),
+            False,
+            False,
+            0
+        )
+
+        box.pack_start(
+            self.axis_row(tool, "y", data["y"]),
+            False,
+            False,
+            0
+        )
+
+        box.pack_start(
+            self.axis_row(tool, "z", data["z"]),
+            False,
+            False,
+            0
+        )
 
         tile.add(box)
+
         return tile
 
     # ------------------------------------------------------------
@@ -173,19 +224,26 @@ class Panel(ScreenPanel):
 
     def axis_row(self, tool, axis, value):
 
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=10
+        )
 
         label = Gtk.Label(label=axis.upper())
         label.set_xalign(0)
+        label.get_style_context().add_class("to-axis-label")
 
         btn = Gtk.Button(label=f"{value:.3f}")
         btn.set_size_request(-1, 50)
-        btn.get_style_context().add_class("pill")
+        btn.get_style_context().add_class("to-pill")
 
         self.values.setdefault(tool, {})[axis] = value
         self.buttons.setdefault(tool, {})[axis] = btn
 
-        btn.connect("clicked", lambda _, t=tool, a=axis: self.open_numpad(t, a))
+        btn.connect(
+            "clicked",
+            lambda _, t=tool, a=axis: self.open_numpad(t, a)
+        )
 
         row.pack_start(label, False, False, 0)
         row.pack_start(btn, True, True, 0)
@@ -193,52 +251,96 @@ class Panel(ScreenPanel):
         return row
 
     # ------------------------------------------------------------
-    # NUMPAD (FIXED GTK3 SAFE)
+    # NUMPAD
     # ------------------------------------------------------------
 
     def open_numpad(self, tool, axis):
 
         win = Gtk.Window(title=f"{tool} {axis}")
+
         win.set_default_size(420, 520)
+
         win.set_modal(True)
         win.set_transient_for(self._screen)
+
         win.set_position(Gtk.WindowPosition.CENTER)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        root.set_margin_start(14)
-        root.set_margin_end(14)
-        root.set_margin_top(14)
-        root.set_margin_bottom(14)
+        win.get_style_context().add_class("to-numpad-window")
 
-        header = Gtk.Label(label=f"{tool} - Axis {axis.upper()}")
-        header.get_style_context().add_class("title")
+        root = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=16
+        )
+
+        root.set_margin_start(20)
+        root.set_margin_end(20)
+        root.set_margin_top(20)
+        root.set_margin_bottom(20)
+
+        header = Gtk.Label(
+            label=f"{tool} - Axis {axis.upper()}"
+        )
+
+        header.get_style_context().add_class("to-numpad-header")
         header.set_xalign(0)
+
         root.pack_start(header, False, False, 0)
 
-        # DISPLAY (NO set_xalign — GTK3 SAFE)
         entry = Gtk.Entry()
+
         entry.set_text(str(self.values[tool][axis]))
         entry.set_editable(False)
-        root.pack_start(entry, False, False, 8)
+        entry.set_can_focus(False)
+        entry.set_alignment(0.5)
+
+        entry.get_style_context().add_class("to-numpad-entry")
+
+        root.pack_start(entry, False, False, 12)
 
         grid = Gtk.Grid()
-        grid.set_row_spacing(8)
-        grid.set_column_spacing(8)
 
-        keys = ["7","8","9","4","5","6","1","2","3","0",".","-"]
+        grid.set_row_spacing(10)
+        grid.set_column_spacing(10)
+        grid.set_column_homogeneous(True)
+        grid.set_row_homogeneous(True)
+
+        keys = [
+            "7", "8", "9",
+            "4", "5", "6",
+            "1", "2", "3",
+            "0", ".", "-"
+        ]
 
         def add(c):
             entry.set_text(entry.get_text() + c)
 
         for i, k in enumerate(keys):
+
             b = Gtk.Button(label=k)
-            b.set_size_request(90, 60)
-            b.connect("clicked", lambda _, c=k: add(c))
-            grid.attach(b, i % 3, i // 3, 1, 1)
 
-        root.pack_start(grid, True, True, 8)
+            b.set_size_request(0, 70)
 
-        action = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            b.get_style_context().add_class("to-numpad-key")
+
+            b.connect(
+                "clicked",
+                lambda _, c=k: add(c)
+            )
+
+            grid.attach(
+                b,
+                i % 3,
+                i // 3,
+                1,
+                1
+            )
+
+        root.pack_start(grid, True, True, 0)
+
+        action = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=10
+        )
 
         def back(_):
             entry.set_text(entry.get_text()[:-1])
@@ -246,33 +348,51 @@ class Panel(ScreenPanel):
         def clear(_):
             entry.set_text("")
 
+        def cancel(_):
+            win.destroy()
+
         def ok(_):
+
             try:
                 val = float(entry.get_text())
             except:
                 return
 
             self.values[tool][axis] = val
-            self.buttons[tool][axis].set_label(f"{val:.3f}")
+
+            self.buttons[tool][axis].set_label(
+                f"{val:.3f}"
+            )
+
             win.destroy()
 
-        back_btn = Gtk.Button(label="⌫")
-        back_btn.set_size_request(120, 50)
+        back_btn = Gtk.Button(label="BS")
+        back_btn.set_size_request(0, 60)
+        back_btn.get_style_context().add_class("to-numpad-action")
         back_btn.connect("clicked", back)
 
         clear_btn = Gtk.Button(label="Clear")
-        clear_btn.set_size_request(120, 50)
+        clear_btn.set_size_request(0, 60)
+        clear_btn.get_style_context().add_class("to-numpad-action")
         clear_btn.connect("clicked", clear)
 
+        cancel_btn = Gtk.Button(label="Cancel")
+        cancel_btn.set_size_request(0, 60)
+        cancel_btn.get_style_context().add_class("to-numpad-action")
+        cancel_btn.connect("clicked", cancel)
+
         ok_btn = Gtk.Button(label="OK")
-        ok_btn.set_size_request(120, 50)
+        ok_btn.set_size_request(0, 60)
+        ok_btn.get_style_context().add_class("to-numpad-action")
+        ok_btn.get_style_context().add_class("to-numpad-ok")
         ok_btn.connect("clicked", ok)
 
         action.pack_start(back_btn, True, True, 0)
         action.pack_start(clear_btn, True, True, 0)
+        action.pack_start(cancel_btn, True, True, 0)
         action.pack_start(ok_btn, True, True, 0)
 
-        root.pack_start(action, False, False, 10)
+        root.pack_start(action, False, False, 0)
 
         win.add(root)
         win.show_all()
@@ -285,7 +405,10 @@ class Panel(ScreenPanel):
 
         for tool, axes in self.values.items():
 
-            path = os.path.join(TOOL_CFG_PATH, f"{tool}.cfg")
+            path = os.path.join(
+                TOOL_CFG_PATH,
+                f"{tool}.cfg"
+            )
 
             if os.path.exists(path):
                 self.write_tool_file(path, tool, axes)
@@ -298,6 +421,7 @@ class Panel(ScreenPanel):
             lines = f.readlines()
 
         section = f"[tool {tool_name}]"
+
         in_section = False
         out = []
 
@@ -316,13 +440,21 @@ class Panel(ScreenPanel):
             if in_section:
 
                 if "gcode_x_offset" in s:
-                    out.append(f"gcode_x_offset: {data['x']}\n")
+                    out.append(
+                        f"gcode_x_offset: {data['x']}\n"
+                    )
                     continue
+
                 if "gcode_y_offset" in s:
-                    out.append(f"gcode_y_offset: {data['y']}\n")
+                    out.append(
+                        f"gcode_y_offset: {data['y']}\n"
+                    )
                     continue
+
                 if "gcode_z_offset" in s:
-                    out.append(f"gcode_z_offset: {data['z']}\n")
+                    out.append(
+                        f"gcode_z_offset: {data['z']}\n"
+                    )
                     continue
 
             out.append(line)
@@ -337,30 +469,111 @@ class Panel(ScreenPanel):
     def apply_css(self):
 
         css = b"""
-        .card {
-            background-color: #20242a;
+        .to-root {
+            background-color: #1a2035;
+        }
+
+        .to-dashboard-title {
+            font-size: 20px;
+            font-weight: 800;
+            color: #ffffff;
+        }
+
+        .to-card {
+            background-color: #242d48;
             border-radius: 14px;
-            border: 1px solid #2e3440;
+            border: 2px solid #2a3a5c;
         }
 
-        .title {
+        .to-tool-title {
             font-size: 18px;
-            font-weight: bold;
-            color: #eceff4;
+            font-weight: 800;
+            color: #00d4ff;
         }
 
-        .pill {
-            border-radius: 12px;
-            background-color: #2e3440;
-            color: #eceff4;
+        .to-axis-label {
+            font-size: 16px;
+            font-weight: 700;
+            color: #ffffff;
         }
 
-        button {
+        .to-pill {
             border-radius: 10px;
+            background-color: #252f4a;
+            color: #ffffff;
+            border: 1px solid #3a4a6e;
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .to-apply {
+            background: #006080;
+            color: #ffffff;
+            border-radius: 10px;
+            border: 2px solid #00d4ff;
+            font-size: 14px;
+            font-weight: 800;
+        }
+
+        .to-numpad-window {
+            background-color: #1a2035;
+        }
+
+        .to-numpad-header {
+            font-size: 22px;
+            font-weight: 800;
+            color: #ffffff;
+        }
+
+        .to-numpad-entry {
+            font-size: 32px;
+            font-weight: 800;
+            color: #ffffff;
+            background-color: #242d48;
+            border-radius: 12px;
+            border: 2px solid #00d4ff;
+            padding: 8px;
+        }
+
+        .to-numpad-key {
+            font-size: 24px;
+            font-weight: 700;
+            background-color: #2a3a5c;
+            color: #ffffff;
+            border-radius: 12px;
+            border: 1px solid #3a4a6e;
+        }
+
+        .to-numpad-key:active {
+            background-color: #00a8cc;
+        }
+
+        .to-numpad-action {
+            font-size: 16px;
+            font-weight: 700;
+            background-color: #252f4a;
+            color: #ffffff;
+            border-radius: 12px;
+            border: 1px solid #3a4a6e;
+        }
+
+        .to-numpad-action:active {
+            background-color: #3a4a6e;
+        }
+
+        .to-numpad-ok {
+            background-color: #006080;
+            color: #ffffff;
+            border: 2px solid #00d4ff;
+        }
+
+        .to-numpad-ok:active {
+            background-color: #0088aa;
         }
         """
 
         provider = Gtk.CssProvider()
+
         provider.load_from_data(css)
 
         Gtk.StyleContext.add_provider_for_screen(
