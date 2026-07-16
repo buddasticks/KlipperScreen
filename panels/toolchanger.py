@@ -6,8 +6,7 @@ ToolchangerPanel rewritten from scratch with a cleaner architecture, safer polli
 and stricter separation between bg I/O and GTK UI updates.
 
 Updated to use KlipperScreen/Moonraker's shared Spoolman proxy instead of a
-panel-local Spoolman URL. This removes the broken custom Spoolman IP handling
-and reuses the same configured Spoolman connection that the built-in
+panel-local Spoolman URL. This reuses the same configured Spoolman connection that the built-in
 KlipperScreen Spoolman panel uses.
 
 Also updated to auto-detect tool count from Moonraker's toolchanger status
