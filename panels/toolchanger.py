@@ -15,6 +15,10 @@ Also updated to auto-detect tool count from Moonraker's toolchanger status
 NEW: Tool offset editor integrated into Settings menu. Adjust X/Y/Z offsets per
      tool with live +/- stepping and save directly to saved_variables.cfg via
      the SAVE_TOOL_OFFSETS macro.
+
+UPDATED: Replaced REST polling thread with websocket push updates via
+     process_update(). Initial state loaded once on activate() via a
+     one-shot REST call. Spoolman is only fetched when spool assignments change.
 """
 
 from __future__ import annotations
@@ -35,7 +39,6 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk
 
 CONFIG_PATH = os.path.expanduser("~/.toolchanger_settings.json")
-POLL_INTERVAL_SECONDS = 1.0
 
 
 # -----------------------------------------------------------------------------
@@ -366,8 +369,7 @@ class ToolchangerPanel:
         self.title = "Tool Changer"
         self.menu = [title]
 
-        self._poll_stop = threading.Event()
-        self._poll_thread: Optional[threading.Thread] = None
+        self._worker_stop = threading.Event()
         self._command_queue: "queue.Queue[str]" = queue.Queue()
         self._command_thread: Optional[threading.Thread] = None
         self._active_popup: Optional[Gtk.Window] = None
@@ -396,7 +398,6 @@ class ToolchangerPanel:
         self.content.show_all()
 
         self._start_command_worker()
-        self._start_polling_worker()
 
     # ------------------------------------------------------------------
     # Configuration / theme
@@ -826,22 +827,130 @@ class ToolchangerPanel:
             return False
 
     # ------------------------------------------------------------------
-    # Polling and snapshots
+    # Initial load (one-shot REST, replaces first poll tick)
     # ------------------------------------------------------------------
 
-    def _start_polling_worker(self) -> None:
-        if self._poll_thread and self._poll_thread.is_alive():
-            return
-        self._refresh_tool_count_from_moonraker()
-        self._poll_stop.clear()
-        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
-        self._poll_thread.start()
+    def _initial_load(self) -> None:
+        """Run once on activate() to populate state before ws updates arrive."""
+        snapshot = self._collect_snapshot()
+        GLib.idle_add(self._apply_snapshot, snapshot)
 
-    def _poll_loop(self) -> None:
-        while not self._poll_stop.is_set():
-            snapshot = self._collect_snapshot()
-            GLib.idle_add(self._apply_snapshot, snapshot)
-            self._poll_stop.wait(POLL_INTERVAL_SECONDS)
+    # ------------------------------------------------------------------
+    # Websocket push updates (replaces polling loop)
+    # ------------------------------------------------------------------
+
+    def process_update(self, action: str, data: dict) -> None:
+        """Called by KlipperScreen on every notify_status_update websocket event."""
+        if action != "notify_status_update":
+            return
+
+        changed = False
+        spoolman_dirty = False
+
+        tc_data = data.get("toolchanger", {}) or {}
+        sv_data = (data.get("save_variables") or {}).get("variables", {})
+
+        tc_status_str = str(tc_data.get("status", "")).lower() if tc_data else None
+        tc_active_tool = tc_data.get("tool_number", -1) if tc_data else None
+
+        for state in self._tool_states:
+            # Temperature updates
+            heater = data.get(state.heater_name, {}) or {}
+            if heater:
+                if "temperature" in heater:
+                    state.temperature = float(heater["temperature"])
+                    changed = True
+                if "target" in heater:
+                    state.target = float(heater["target"])
+                    changed = True
+
+            # Tool active / ktc state
+            tool_obj = data.get(f"tool T{state.index}", {}) or {}
+            if tool_obj or tc_data:
+                tool_active = tool_obj.get("active", None)
+                if tool_active is not None:
+                    state.active = tool_active is True
+
+                if tc_status_str == "error":
+                    state.ktc_state = "error"
+                elif tc_status_str == "changing" and tc_active_tool == state.index:
+                    state.ktc_state = "changing"
+                elif tool_active is True:
+                    state.ktc_state = "active"
+                elif tool_active is False:
+                    state.ktc_state = "docked"
+
+                changed = True
+
+            # save_variables — spool assignments and offsets
+            if sv_data:
+                spool_key = f"t{state.index}__spool_id"
+                if spool_key in sv_data:
+                    try:
+                        new_id = int(sv_data[spool_key]) if sv_data[spool_key] else None
+                    except Exception:
+                        new_id = None
+                    if new_id != state.spool_id:
+                        state.spool_id = new_id
+                        spoolman_dirty = True
+
+                for axis in ("x", "y", "z"):
+                    key = f"t{state.index}_gcode_{axis}_offset"
+                    if key in sv_data:
+                        setattr(state, f"{axis}_offset", float(sv_data[key] or 0.0))
+                        changed = True
+
+            # Maintain PID tuning state
+            if self._pid_tuning_tool_index == state.index:
+                pid_elapsed = 0.0
+                if self._pid_tuning_started_at is not None:
+                    pid_elapsed = max(0.0, time.monotonic() - self._pid_tuning_started_at)
+
+                if state.ktc_state == "error":
+                    self._pid_tuning_tool_index = None
+                    self._pid_tuning_started_at = None
+                elif state.target > 0 or pid_elapsed < 8.0:
+                    state.ktc_state = "pid_tuning"
+                    changed = True
+                else:
+                    self._pid_tuning_tool_index = None
+                    self._pid_tuning_started_at = None
+
+        if spoolman_dirty:
+            # Re-fetch spool data in bg — only when spool assignments actually change
+            threading.Thread(target=self._refresh_spoolman, daemon=True).start()
+        elif changed:
+            GLib.idle_add(self._apply_snapshot, RuntimeSnapshot(tools=self._tool_states))
+
+    def _refresh_spoolman(self) -> None:
+        """Fetch current spool data for all tools and push a UI update."""
+        for state in self._tool_states:
+            if not state.spool_id:
+                state.material = "EMPTY"
+                state.color_hex = "#333b54"
+                state.remaining_ratio = -1.0
+                state.spool_error = False
+                continue
+
+            spool = self._spoolman_get_spool(state.spool_id)
+            if spool is None:
+                state.spool_error = True
+                continue
+
+            filament = spool.get("filament", {}) or {}
+            state.material = str(filament.get("material", "??")).upper()
+            state.color_hex = normalize_hex(str(filament.get("color_hex") or "#333b54"))
+            state.spool_error = False
+
+            total = float(filament.get("weight", 0) or 0)
+            used = float(spool.get("used_weight", 0) or 0)
+            state.remaining_ratio = clamp01(1.0 - used / total) if total > 0 else -1.0
+
+        GLib.idle_add(self._apply_snapshot, RuntimeSnapshot(tools=self._tool_states))
+
+    # ------------------------------------------------------------------
+    # Snapshot (used only for initial load)
+    # ------------------------------------------------------------------
 
     def _collect_snapshot(self) -> RuntimeSnapshot:
         base_states = [ToolState(index=s.index, heater_name=s.heater_name) for s in self._tool_states]
@@ -867,8 +976,6 @@ class ToolchangerPanel:
             tool_obj = status.get(f"tool T{state.index}", {}) or {}
             tool_active = tool_obj.get("active", None)
 
-            # Use the toolchanger's reported tool state instead of toolhead.extruder.
-            # This prevents T0 from appearing active on boot when no tool is mounted.
             state.active = (tool_active is True)
 
             if tc_status_str == "error":
@@ -910,33 +1017,9 @@ class ToolchangerPanel:
                 state.color_hex = "#333b54"
                 state.remaining_ratio = -1.0
 
-            # Load tool offsets from saved_variables (source of truth)
             state.x_offset = float(save_variables.get(f"t{state.index}_gcode_x_offset", 0.0) or 0.0)
             state.y_offset = float(save_variables.get(f"t{state.index}_gcode_y_offset", 0.0) or 0.0)
             state.z_offset = float(save_variables.get(f"t{state.index}_gcode_z_offset", 0.0) or 0.0)
-
-        if self._pid_tuning_tool_index is not None:
-            idx = self._pid_tuning_tool_index
-
-            if idx >= len(base_states):
-                self._pid_tuning_tool_index = None
-                self._pid_tuning_started_at = None
-            else:
-                pid_state = base_states[idx]
-                pid_elapsed = 0.0
-                if self._pid_tuning_started_at is not None:
-                    pid_elapsed = max(0.0, time.monotonic() - self._pid_tuning_started_at)
-
-                if pid_state.ktc_state == "error":
-                    self._pid_tuning_tool_index = None
-                    self._pid_tuning_started_at = None
-                elif pid_state.ktc_state == "changing":
-                    pass
-                elif pid_state.target > 0 or pid_elapsed < 8.0:
-                    pid_state.ktc_state = "pid_tuning"
-                else:
-                    self._pid_tuning_tool_index = None
-                    self._pid_tuning_started_at = None
 
         return RuntimeSnapshot(tools=base_states, moonraker_ok=True)
 
@@ -1018,7 +1101,7 @@ class ToolchangerPanel:
         self._command_thread.start()
 
     def _command_loop(self) -> None:
-        while not self._poll_stop.is_set():
+        while not self._worker_stop.is_set():
             try:
                 command = self._command_queue.get(timeout=0.25)
             except queue.Empty:
@@ -1217,7 +1300,6 @@ class ToolchangerPanel:
 
     def _select_tool(self, tool_index: int) -> None:
         self._request_tool_activation(tool_index, require_spool=True, notify_if_active=True)
-
 
     # ------------------------------------------------------------------
     # Simple message popup
@@ -1533,6 +1615,7 @@ class ToolchangerPanel:
 
         popup.add(layout)
         popup.show_all()
+
     def _show_tool_selector(self, _widget: Gtk.Widget) -> None:
         popup = self._register_popup(popup_window(self._screen))
 
@@ -2510,7 +2593,7 @@ class ToolchangerPanel:
         popup.show_all()
 
     # ------------------------------------------------------------------
-    # Tool offset editor (NEW)
+    # Tool offset editor
     # ------------------------------------------------------------------
 
     def _show_offset_select(self) -> None:
@@ -2693,7 +2776,6 @@ class ToolchangerPanel:
         header_box.pack_start(subtitle, False, False, 0)
         outer.pack_start(header_box, False, False, 0)
 
-        # Step size selector
         step_row = box(Gtk.Orientation.HORIZONTAL, 8)
         step_row.set_halign(Gtk.Align.CENTER)
         step_buttons: Dict[float, Gtk.Button] = {}
@@ -2720,7 +2802,6 @@ class ToolchangerPanel:
         set_step(0.05)
         outer.pack_start(step_row, False, False, 0)
 
-        # Axis editors
         axes_box = box(Gtk.Orientation.HORIZONTAL, 16)
         axes_box.set_halign(Gtk.Align.CENTER)
         axes_box.set_vexpand(True)
@@ -2775,7 +2856,6 @@ class ToolchangerPanel:
             param = f"gcode_{axis.lower()}_offset"
             self._queue_gcode(f"SET_TOOL_PARAMETER T={tool_index} PARAMETER={param} VALUE={new_val}")
 
-        # Bottom buttons
         bottom = box(Gtk.Orientation.HORIZONTAL, 12)
         bottom.set_halign(Gtk.Align.CENTER)
 
@@ -2807,12 +2887,14 @@ class ToolchangerPanel:
     # ------------------------------------------------------------------
 
     def activate(self) -> None:
-        self._poll_stop.clear()
+        self._worker_stop.clear()
         self._start_command_worker()
-        self._start_polling_worker()
+        self._refresh_tool_count_from_moonraker()
+        # One-shot initial load — populates state before ws updates arrive
+        threading.Thread(target=self._initial_load, daemon=True).start()
 
     def deactivate(self) -> None:
-        self._poll_stop.set()
+        self._worker_stop.set()
 
 
 Panel = ToolchangerPanel
