@@ -13,7 +13,7 @@ This branch adds a dedicated toolchanger workflow to KlipperScreen for multi-too
 ### What this branch adds
 
 The `toolchanger-ui` branch includes:
-
+ - persistent per-tool X/Y/Z gcode offset management with automatic restore from `saved_variables.cfg`, avoiding repeated `SAVE_CONFIG` operations for tool offset adjustments
 - a dedicated **Tools** panel for selecting tools, assigning spools, loading and unloading filament, setting temperatures, and running PID tuning
 - automatic tool-count detection from Moonraker toolchanger status (`tool_numbers` / `tool_names`)
 - tool-aware status handling in the UI, including **ACTIVE**, **CHANGING**, **PARKED**, **HEATING**, **ERROR**, and **PID TUNE**
@@ -33,8 +33,30 @@ This branch is intended for printers that already have:
 - Moonraker access to the printer's toolchanger-related objects
 - Spoolman configured if you want spool assignment, spool restore, and spool metadata in the UI
 - `save_variables` enabled if you want spool assignments to persist across restarts
-
+- 
 This is not a complete drop-in toolchanger configuration by itself. It expects the printer-side toolchanger logic to already exist.
+
+### Tool Offset Persistence
+
+The `toolchanger-ui` branch now supports persistent per-tool gcode offsets without requiring `SAVE_CONFIG`.
+
+Instead of writing tool offsets into `printer.cfg`, the supplied helper macros store each tool's `gcode_x_offset`, `gcode_y_offset`, and `gcode_z_offset` inside Klipper's `saved_variables.cfg`. Offsets are automatically restored during printer startup, allowing runtime adjustments to persist across reboots while keeping the main configuration unchanged.
+
+This provides several advantages:
+
+- no repeated writes to `printer.cfg`
+- no automatic `SAVE_CONFIG` after every offset adjustment
+- offsets survive printer restarts
+- runtime tool calibration can be performed without modifying the printer configuration
+- easy backup and migration through `saved_variables.cfg`
+
+The accompanying reference macro pack includes:
+
+- `LOAD_TOOL_OFFSETS` — automatically restores all saved tool offsets during startup.
+- `SAVE_TOOL_OFFSETS` — saves every tool's current X/Y/Z offsets to `saved_variables.cfg`.
+- `SET_AND_SAVE_TOOL_OFFSET` — updates one or more offsets for a tool and immediately persists the changes.
+
+This feature requires Klipper's `[save_variables]` module to be enabled.
 
 ## Required printer macros for `toolchanger-ui`
 
