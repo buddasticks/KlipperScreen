@@ -11,6 +11,10 @@ KlipperScreen Spoolman panel uses.
 
 Also updated to auto-detect tool count from Moonraker's toolchanger status
 (tool_numbers / tool_names) and remove the manual tool count setting.
+
+NEW: Tool offset editor integrated into Settings menu. Adjust X/Y/Z offsets per
+     tool with live +/- stepping and save directly to saved_variables.cfg via
+     the SAVE_TOOL_OFFSETS macro.
 """
 
 from __future__ import annotations
@@ -27,13 +31,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 
-
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, GLib, Gtk
 
 CONFIG_PATH = os.path.expanduser("~/.toolchanger_settings.json")
 POLL_INTERVAL_SECONDS = 1.0
-
 
 
 # -----------------------------------------------------------------------------
@@ -264,6 +266,9 @@ class ToolState:
     reachable: bool = True
     spool_error: bool = False
     ktc_state: str = "unknown"
+    x_offset: float = 0.0
+    y_offset: float = 0.0
+    z_offset: float = 0.0
 
     @property
     def display_title(self) -> str:
@@ -904,6 +909,11 @@ class ToolchangerPanel:
                 state.material = "EMPTY"
                 state.color_hex = "#333b54"
                 state.remaining_ratio = -1.0
+
+            # Load tool offsets from saved_variables (source of truth)
+            state.x_offset = float(save_variables.get(f"t{state.index}_gcode_x_offset", 0.0) or 0.0)
+            state.y_offset = float(save_variables.get(f"t{state.index}_gcode_y_offset", 0.0) or 0.0)
+            state.z_offset = float(save_variables.get(f"t{state.index}_gcode_z_offset", 0.0) or 0.0)
 
         if self._pid_tuning_tool_index is not None:
             idx = self._pid_tuning_tool_index
@@ -1844,7 +1854,7 @@ class ToolchangerPanel:
 
         outer = box(spacing=12)
         outer.get_style_context().add_class("tc-popup")
-        outer.set_size_request(560, 260)
+        outer.set_size_request(640, 260)
         outer.set_margin_top(16)
         outer.set_margin_bottom(16)
         outer.set_margin_start(16)
@@ -1873,11 +1883,12 @@ class ToolchangerPanel:
         actions = [
             ("PID TUNE", lambda _w: (popup.destroy(), self._show_pid_select())),
             ("THEME", lambda _w: (popup.destroy(), self._show_theme())),
+            ("TOOL OFFSETS", lambda _w: (popup.destroy(), self._show_offset_select())),
         ]
 
         for label, callback in actions:
             b = button(label, "tc-btn-select", callback)
-            b.set_size_request(190, 90)
+            b.set_size_request(170, 90)
             row.pack_start(b, False, False, 0)
 
         outer.pack_start(row, True, True, 0)
@@ -2494,6 +2505,299 @@ class ToolchangerPanel:
         btn_row.pack_start(back_btn, False, False, 0)
 
         outer.pack_start(btn_row, False, False, 0)
+
+        popup.add(outer)
+        popup.show_all()
+
+    # ------------------------------------------------------------------
+    # Tool offset editor (NEW)
+    # ------------------------------------------------------------------
+
+    def _show_offset_select(self) -> None:
+        popup = self._register_popup(popup_window(self._screen))
+
+        outer = box(spacing=10)
+        outer.get_style_context().add_class("tc-popup")
+        outer.set_size_request(800, 340)
+        outer.set_margin_top(14)
+        outer.set_margin_bottom(14)
+        outer.set_margin_start(14)
+        outer.set_margin_end(14)
+
+        header_box = box(spacing=2)
+        header_box.set_halign(Gtk.Align.CENTER)
+
+        title = Gtk.Label(label="TOOL OFFSETS - SELECT TOOL")
+        title.get_style_context().add_class("tc-popup-title")
+        title.set_xalign(0.5)
+
+        subtitle = Gtk.Label(label="Tap a tool card to edit its offsets.")
+        subtitle.get_style_context().add_class("tc-popup-subtitle")
+        subtitle.set_xalign(0.5)
+
+        header_box.pack_start(title, False, False, 0)
+        header_box.pack_start(subtitle, False, False, 0)
+        outer.pack_start(header_box, False, False, 0)
+
+        cards_row = box(Gtk.Orientation.HORIZONTAL, 10)
+        cards_row.set_halign(Gtk.Align.CENTER)
+        cards_row.set_valign(Gtk.Align.CENTER)
+        cards_row.set_hexpand(True)
+        cards_row.set_vexpand(True)
+
+        for state in self._tool_states:
+            def on_pick(_w: Gtk.Widget, idx: int = state.index) -> None:
+                popup.destroy()
+                self._show_offset_editor(idx)
+
+            card_button = Gtk.Button()
+            card_button.set_relief(Gtk.ReliefStyle.NONE)
+            card_button.get_style_context().add_class("tc-popup-flat-btn")
+            card_button.set_size_request(175, 210)
+            card_button.connect("clicked", on_pick)
+
+            card = box(spacing=4)
+            card.set_halign(Gtk.Align.CENTER)
+            card.set_valign(Gtk.Align.CENTER)
+            card.set_size_request(155, 190)
+            card.set_margin_top(8)
+            card.set_margin_bottom(8)
+            card.set_margin_start(8)
+            card.set_margin_end(8)
+
+            card_ctx = card.get_style_context()
+            if state.active:
+                card_ctx.add_class("tc-popup-card-active")
+            else:
+                card_ctx.add_class("tc-popup-card")
+
+            tool_label = Gtk.Label(label=f"T{state.index}")
+            tool_label.get_style_context().add_class("tc-popup-card-title")
+            tool_label.set_xalign(0.5)
+            tool_label.set_justify(Gtk.Justification.CENTER)
+            card.pack_start(tool_label, False, False, 0)
+
+            spool_logo = Gtk.DrawingArea()
+            spool_logo.set_size_request(44, 44)
+
+            def draw_mini_spool(widget: Gtk.DrawingArea, cr: cairo.Context, s: ToolState = state) -> bool:
+                w = widget.get_allocated_width()
+                h = widget.get_allocated_height()
+                cx = w / 2.0
+                cy = h / 2.0
+                outer_r = 14
+                inner_r = 8
+                hub_r = 3
+                color = normalize_hex(s.color_hex if s.spool_id else "#4a5675")
+                r, g, b = hex_to_rgb01(color)
+
+                cr.set_source_rgba(1, 1, 1, 0.08)
+                cr.set_line_width(7)
+                cr.arc(cx, cy, (outer_r + inner_r) / 2.0, 0, 2 * math.pi)
+                cr.stroke()
+
+                grad = cairo.LinearGradient(cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r)
+                grad.add_color_stop_rgb(0.0, min(1, r * 1.08 + 0.06), min(1, g * 1.08 + 0.06), min(1, b * 1.08 + 0.06))
+                grad.add_color_stop_rgb(1.0, max(0, r * 0.55), max(0, g * 0.55), max(0, b * 0.55))
+                cr.set_source(grad)
+                cr.set_line_width(6)
+                cr.arc(cx, cy, (outer_r + inner_r) / 2.0, 0, 2 * math.pi)
+                cr.stroke()
+
+                cr.set_source_rgba(0.15, 0.20, 0.32, 1.0)
+                cr.arc(cx, cy, inner_r, 0, 2 * math.pi)
+                cr.fill()
+
+                cr.set_source_rgba(1, 1, 1, 0.30)
+                cr.set_line_width(1.0)
+                cr.arc(cx, cy, outer_r, -1.9, -0.8)
+                cr.stroke()
+
+                cr.set_source_rgba(1, 1, 1, 0.22)
+                cr.set_line_width(0.8)
+                cr.arc(cx, cy, hub_r, 0, 2 * math.pi)
+                cr.stroke()
+
+                return False
+
+            spool_logo.connect("draw", draw_mini_spool)
+            card.pack_start(spool_logo, False, False, 0)
+
+            filament = Gtk.Label(label=state.material if state.spool_id else "EMPTY")
+            filament.get_style_context().add_class("tc-popup-card-sub")
+            filament.set_xalign(0.5)
+            filament.set_justify(Gtk.Justification.CENTER)
+            filament.set_line_wrap(True)
+            card.pack_start(filament, False, False, 0)
+
+            offsets_box = box(spacing=1)
+            offsets_box.set_halign(Gtk.Align.CENTER)
+
+            for axis, val in (("X", state.x_offset), ("Y", state.y_offset), ("Z", state.z_offset)):
+                lbl = Gtk.Label(label=f"{axis}:{val:.2f}")
+                lbl.get_style_context().add_class("tc-popup-card-temp")
+                lbl.set_xalign(0.5)
+                lbl.set_justify(Gtk.Justification.CENTER)
+                offsets_box.pack_start(lbl, False, False, 0)
+
+            card.pack_start(offsets_box, False, False, 0)
+
+            card_button.add(card)
+            cards_row.pack_start(card_button, False, False, 0)
+
+        outer.pack_start(cards_row, True, True, 0)
+
+        footer = box(Gtk.Orientation.HORIZONTAL, 10)
+        footer.set_halign(Gtk.Align.CENTER)
+
+        back = button("BACK", "tc-btn-global", lambda _w: (popup.destroy(), self._show_settings(None)))
+        back.set_size_request(160, 42)
+        cancel = button("CLOSE", "tc-btn-global", lambda _w: popup.destroy())
+        cancel.set_size_request(160, 42)
+        footer.pack_start(back, False, False, 0)
+        footer.pack_start(cancel, False, False, 0)
+
+        outer.pack_start(footer, False, False, 0)
+
+        popup.add(outer)
+        popup.show_all()
+
+    def _show_offset_editor(self, tool_index: int) -> None:
+        if tool_index >= len(self._tool_states):
+            self._show_message("Selected tool is no longer available")
+            return
+
+        popup = self._register_popup(popup_window(self._screen))
+        state = self._tool_states[tool_index]
+
+        outer = box(spacing=12)
+        outer.get_style_context().add_class("tc-popup")
+        outer.set_size_request(640, 420)
+        outer.set_margin_top(16)
+        outer.set_margin_bottom(16)
+        outer.set_margin_start(16)
+        outer.set_margin_end(16)
+
+        header_box = box(spacing=2)
+        header_box.set_halign(Gtk.Align.CENTER)
+
+        title = Gtk.Label(label=f"EDIT OFFSETS - T{tool_index}")
+        title.get_style_context().add_class("tc-popup-title")
+        title.set_xalign(0.5)
+
+        subtitle = Gtk.Label(label="Select step size, then tap +/- to adjust")
+        subtitle.get_style_context().add_class("tc-popup-subtitle")
+        subtitle.set_xalign(0.5)
+
+        header_box.pack_start(title, False, False, 0)
+        header_box.pack_start(subtitle, False, False, 0)
+        outer.pack_start(header_box, False, False, 0)
+
+        # Step size selector
+        step_row = box(Gtk.Orientation.HORIZONTAL, 8)
+        step_row.set_halign(Gtk.Align.CENTER)
+        step_buttons: Dict[float, Gtk.Button] = {}
+        step_state = {"step": 0.05}
+
+        for step_val in (0.01, 0.05, 0.1, 1.0):
+            label_text = f"{step_val:.2f}".rstrip("0").rstrip(".") + "mm"
+            btn = button(label_text, "tc-btn-global", lambda _w, sv=step_val: set_step(sv))
+            btn.set_size_request(80, 42)
+            step_buttons[step_val] = btn
+            step_row.pack_start(btn, False, False, 0)
+
+        def set_step(val: float) -> None:
+            step_state["step"] = val
+            for v, b in step_buttons.items():
+                ctx = b.get_style_context()
+                if abs(v - val) < 0.001:
+                    ctx.remove_class("tc-btn-global")
+                    ctx.add_class("tc-btn-select")
+                else:
+                    ctx.remove_class("tc-btn-select")
+                    ctx.add_class("tc-btn-global")
+
+        set_step(0.05)
+        outer.pack_start(step_row, False, False, 0)
+
+        # Axis editors
+        axes_box = box(Gtk.Orientation.HORIZONTAL, 16)
+        axes_box.set_halign(Gtk.Align.CENTER)
+        axes_box.set_vexpand(True)
+
+        axis_displays: Dict[str, Gtk.Label] = {}
+        values = {
+            "X": state.x_offset,
+            "Y": state.y_offset,
+            "Z": state.z_offset,
+        }
+
+        for axis in ("X", "Y", "Z"):
+            axis_frame = box(spacing=8)
+            axis_frame.get_style_context().add_class("tc-popup-card")
+            axis_frame.set_size_request(170, -1)
+            axis_frame.set_margin_top(8)
+            axis_frame.set_margin_bottom(8)
+            axis_frame.set_margin_start(8)
+            axis_frame.set_margin_end(8)
+
+            axis_label = Gtk.Label(label=axis)
+            axis_label.get_style_context().add_class("tc-popup-card-title")
+            axis_frame.pack_start(axis_label, False, False, 0)
+
+            val_label = Gtk.Label(label=f"{values[axis]:.3f}")
+            val_label.get_style_context().add_class("tc-temp-label")
+            axis_displays[axis] = val_label
+            axis_frame.pack_start(val_label, False, False, 0)
+
+            btn_row = box(Gtk.Orientation.HORIZONTAL, 8)
+            btn_row.set_halign(Gtk.Align.CENTER)
+
+            minus_btn = button("-", "tc-btn-global", lambda _w, ax=axis: adjust_axis(ax, -1))
+            minus_btn.set_size_request(58, 48)
+            plus_btn = button("+", "tc-btn-global", lambda _w, ax=axis: adjust_axis(ax, 1))
+            plus_btn.set_size_request(58, 48)
+
+            btn_row.pack_start(minus_btn, False, False, 0)
+            btn_row.pack_start(plus_btn, False, False, 0)
+            axis_frame.pack_start(btn_row, False, False, 0)
+
+            axes_box.pack_start(axis_frame, False, False, 0)
+
+        outer.pack_start(axes_box, True, True, 0)
+
+        def adjust_axis(axis: str, direction: int) -> None:
+            step = step_state["step"]
+            new_val = values[axis] + (direction * step)
+            new_val = round(new_val, 3)
+            values[axis] = new_val
+            axis_displays[axis].set_text(f"{new_val:.3f}")
+            param = f"gcode_{axis.lower()}_offset"
+            self._queue_gcode(f"SET_TOOL_PARAMETER T={tool_index} PARAMETER={param} VALUE={new_val}")
+
+        # Bottom buttons
+        bottom = box(Gtk.Orientation.HORIZONTAL, 12)
+        bottom.set_halign(Gtk.Align.CENTER)
+
+        save_btn = button("SAVE OFFSETS", "tc-btn-select", lambda _w: save_offsets())
+        save_btn.set_size_request(180, 58)
+
+        back_btn = button("BACK", "tc-btn-global", lambda _w: (popup.destroy(), self._show_offset_select()))
+        back_btn.set_size_request(130, 48)
+
+        cancel_btn = button("CLOSE", "tc-btn-global", lambda _w: popup.destroy())
+        cancel_btn.set_size_request(130, 48)
+
+        bottom.pack_start(back_btn, False, False, 0)
+        bottom.pack_start(cancel_btn, False, False, 0)
+        bottom.pack_start(save_btn, False, False, 0)
+
+        outer.pack_start(bottom, False, False, 0)
+
+        def save_offsets() -> None:
+            self._queue_gcode("SAVE_TOOL_OFFSETS")
+            popup.destroy()
+            self._show_message(f"T{tool_index} offsets saved to saved_variables.cfg")
 
         popup.add(outer)
         popup.show_all()
