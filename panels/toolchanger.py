@@ -882,7 +882,7 @@ class ToolchangerPanel:
 
                 changed = True
 
-            # save_variables — spool assignments and offsets
+            # save_variables â€” spool assignments and offsets
             if sv_data:
                 spool_key = f"t{state.index}__spool_id"
                 if spool_key in sv_data:
@@ -917,7 +917,7 @@ class ToolchangerPanel:
                     self._pid_tuning_started_at = None
 
         if spoolman_dirty:
-            # Re-fetch spool data in bg — only when spool assignments actually change
+            # Re-fetch spool data in bg â€” only when spool assignments actually change
             threading.Thread(target=self._refresh_spoolman, daemon=True).start()
         elif changed:
             GLib.idle_add(self._apply_snapshot, RuntimeSnapshot(tools=self._tool_states))
@@ -951,6 +951,42 @@ class ToolchangerPanel:
     # ------------------------------------------------------------------
     # Snapshot (used only for initial load)
     # ------------------------------------------------------------------
+
+    def _start_spool_watcher(self) -> None:
+        """Poll save_variables every 4s to catch external spool changes."""
+        def check() -> bool:
+            if self._worker_stop.is_set():
+                return False
+            threading.Thread(target=self._check_spool_assignments, daemon=True).start()
+            return True
+        GLib.timeout_add_seconds(4, check)
+
+    def _check_spool_assignments(self) -> None:
+        try:
+            response = self._screen.apiclient.send_request("printer/objects/query?save_variables") or {}
+            if isinstance(response, dict) and "result" in response:
+                status = response["result"].get("status", {})
+            else:
+                status = response.get("status", {})
+            variables = status.get("save_variables", {}).get("variables", {})
+        except Exception:
+            return
+
+        dirty = False
+        for state in self._tool_states:
+            spool_key = f"t{state.index}__spool_id"
+            if spool_key not in variables:
+                continue
+            try:
+                new_id = int(variables[spool_key]) if variables[spool_key] else None
+            except Exception:
+                new_id = None
+            if new_id != state.spool_id:
+                state.spool_id = new_id
+                dirty = True
+
+        if dirty:
+            self._refresh_spoolman()
 
     def _collect_snapshot(self) -> RuntimeSnapshot:
         base_states = [ToolState(index=s.index, heater_name=s.heater_name) for s in self._tool_states]
@@ -1811,6 +1847,9 @@ class ToolchangerPanel:
             self._queue_gcode(f"SAVE_VARIABLE VARIABLE=t{tool_index}__spool_id VALUE={spool_id}")
             self._queue_gcode(f"SET_GCODE_VARIABLE MACRO=T{tool_index} VARIABLE=spool_id VALUE={spool_id}")
             self._set_active_spoolman_spool(spool_id)
+            # Optimistically update local state and refresh immediately
+            self._tool_states[tool_index].spool_id = spool_id
+            threading.Thread(target=self._refresh_spoolman, daemon=True).start()
             popup.destroy()
 
         def build_row(spool: Dict[str, Any]) -> Gtk.Button:
@@ -1930,6 +1969,9 @@ class ToolchangerPanel:
         self._queue_gcode(f"SAVE_VARIABLE VARIABLE=t{tool_index}__spool_id VALUE=0")
         self._queue_gcode(f"SET_GCODE_VARIABLE MACRO=T{tool_index} VARIABLE=spool_id VALUE=0")
         self._set_active_spoolman_spool(None)
+        # Optimistically update local state and refresh immediately
+        self._tool_states[tool_index].spool_id = None
+        threading.Thread(target=self._refresh_spoolman, daemon=True).start()
         popup.destroy()
 
     def _show_settings(self, _widget: Gtk.Widget) -> None:
@@ -2890,7 +2932,7 @@ class ToolchangerPanel:
         self._worker_stop.clear()
         self._start_command_worker()
         self._refresh_tool_count_from_moonraker()
-        # One-shot initial load — populates state before ws updates arrive
+        self._start_spool_watcher()
         threading.Thread(target=self._initial_load, daemon=True).start()
 
     def deactivate(self) -> None:
