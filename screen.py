@@ -755,12 +755,16 @@ class KlipperScreen(Gtk.Window):
         else:
             self.panels['printer_select'].disconnected_callback()
 
+    # ------------------------------------------------------------------ State callbacks
+    # All state methods use GLib.idle_add so GTK calls always land on the main thread,
+    # regardless of which thread (websocket, timer, etc.) triggered the state change.
+
     def state_disconnected(self):
         logging.debug("### Going to disconnected")
         self.printer.stop_tempstore_updates()
         self.initialized = False
         self.reinit_count = 0
-        self._init_printer(_("Klipper has disconnected"), go_to_splash=True)
+        GLib.idle_add(self._init_printer, _("Klipper has disconnected"), True)
 
     def state_error(self):
         msg = _("Klipper has encountered an error.") + "\n"
@@ -769,15 +773,19 @@ class KlipperScreen(Gtk.Window):
             msg += _("A FIRMWARE_RESTART may fix the issue.") + "\n"
         elif "micro-controller" in state:
             msg += _("Please recompile and flash the micro-controller.") + "\n"
-        self.printer_initializing(msg + "\n" + state, go_to_splash=True)
+        GLib.idle_add(self.printer_initializing, msg + "\n" + state, True)
 
     def state_paused(self):
-        self.state_printing()
+        GLib.idle_add(self._do_state_printing)
         if self._config.get_main_config().getboolean("auto_open_extrude", fallback=True):
-            self.show_panel("extrude")
+            GLib.idle_add(self.show_panel, "extrude")
 
     def state_printing(self):
+        GLib.idle_add(self._do_state_printing)
+
+    def _do_state_printing(self):
         self.show_panel("job_status", remove_all=True)
+        return GLib.SOURCE_REMOVE
 
     def state_ready(self, wait=True):
         # Do not return to main menu if completing a job, timeouts/user input will return
@@ -788,15 +796,21 @@ class KlipperScreen(Gtk.Window):
             self.printer.state = "not ready"
             return
         self.files.refresh_files()
+        GLib.idle_add(self._do_state_ready)
+
+    def _do_state_ready(self):
         self.show_panel("main_menu", remove_all=True, items=self._config.get_menu_items("__main"))
+        return GLib.SOURCE_REMOVE
 
     def state_startup(self):
-        self.printer_initializing(_("Klipper is attempting to start"))
+        GLib.idle_add(self.printer_initializing, _("Klipper is attempting to start"))
 
     def state_shutdown(self):
         self.printer.stop_tempstore_updates()
         msg = self.printer.get_stat("webhooks", "state_message")
-        self.printer_initializing(_("Klipper has shutdown") + "\n\n" + msg, go_to_splash=True)
+        GLib.idle_add(self.printer_initializing, _("Klipper has shutdown") + "\n\n" + msg, True)
+
+    # ------------------------------------------------------------------ End state callbacks
 
     def toggle_shortcut(self, show):
         if show and not self.printer.get_printer_status_data()["printer"]["gcode_macros"]["count"] > 0:
