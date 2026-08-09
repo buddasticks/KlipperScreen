@@ -659,8 +659,14 @@ class Panel(ScreenPanel):
         return mapping
 
     def update_spool_data(self):
+        import threading
+        threading.Thread(target=self._fetch_spool_data_bg, daemon=True).start()
+        return True  # keep GLib timer alive
+
+    def _fetch_spool_data_bg(self):
+        """Runs on a background thread - no GTK calls here."""
         spool_ids = self._moonraker_tool_spool_ids()
-        self.tool_spools = {}
+        tool_spools = {}
         for tool_idx, spool_id in spool_ids.items():
             if not spool_id:
                 continue
@@ -672,16 +678,19 @@ class Panel(ScreenPanel):
             color_hex = self._normalize_tool_color(filament.get("color_hex"))
             total_weight = float(filament.get("weight", 0) or 0)
             used_weight = float(spool.get("used_weight", 0) or 0)
-            ratio = None
-            if total_weight > 0:
-                ratio = max(0.0, min(1.0, 1.0 - (used_weight / total_weight)))
-            self.tool_spools[int(tool_idx)] = {
+            ratio = max(0.0, min(1.0, 1.0 - (used_weight / total_weight))) if total_weight > 0 else None
+            tool_spools[int(tool_idx)] = {
                 "material": material, "color": color_hex,
                 "ratio": ratio, "spool_id": int(spool_id),
             }
-        self._update_tool_strip_runtime()
-        return True
+        # Hand results back to GTK main thread
+        GLib.idle_add(self._apply_spool_data, tool_spools)
 
+    def _apply_spool_data(self, tool_spools):
+        """Called on GTK main thread."""
+        self.tool_spools = tool_spools
+        self._update_tool_strip_runtime()
+        return GLib.SOURCE_REMOVE
     # ------------------------------------------------------------------ Status grid
 
     def create_status_grid(self, widget=None):
