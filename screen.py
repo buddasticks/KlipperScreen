@@ -80,6 +80,8 @@ class KlipperScreen(Gtk.Window):
     prompt = None
     tempstore_timeout = None
     check_dpms_timeout = None
+    # Prevent duplicate print-start screen transitions.
+    _job_status_transition_pending = False
 
     def __init__(self, args):
         self.server_info = None
@@ -776,14 +778,32 @@ class KlipperScreen(Gtk.Window):
         GLib.idle_add(self.printer_initializing, msg + "\n" + state, True)
 
     def state_paused(self):
-        GLib.idle_add(self._do_state_printing)
+        self._queue_job_status()
         if self._config.get_main_config().getboolean("auto_open_extrude", fallback=True):
             GLib.idle_add(self.show_panel, "extrude")
 
     def state_printing(self):
-        GLib.idle_add(self._do_state_printing)
+        self._queue_job_status()
+
+    def _queue_job_status(self):
+        """Queue Job Status at normal GTK event priority.
+
+        The previous idle callback could be delayed behind continuously-ready
+        GLib sources in the customized toolchanger UI until a touchscreen
+        event occurred. A zero-delay timeout runs at normal event priority.
+        """
+        if self._job_status_transition_pending:
+            return
+        if self._cur_panels and self._cur_panels[-1] == "job_status":
+            return
+        self._job_status_transition_pending = True
+        GLib.timeout_add(0, self._do_state_printing)
 
     def _do_state_printing(self):
+        self._job_status_transition_pending = False
+        if self._cur_panels and self._cur_panels[-1] == "job_status":
+            return GLib.SOURCE_REMOVE
+        logging.info("Print started: switching to Job Status")
         self.show_panel("job_status", remove_all=True)
         return GLib.SOURCE_REMOVE
 
@@ -861,6 +881,16 @@ class KlipperScreen(Gtk.Window):
             return
         elif action == "notify_status_update" and self.printer.state != "shutdown":
             self.printer.process_update(data)
+
+            # Moonraker's print_stats is the authoritative print state.
+            # Explicitly queue the screen transition here as well as through
+            # the Printer state callback, with the queue guard preventing
+            # duplicate panel loads.
+            if isinstance(data, dict):
+                print_stats = data.get("print_stats", {})
+                if print_stats.get("state") == "printing":
+                    self._queue_job_status()
+
             if 'manual_probe' in data and data['manual_probe']['is_active'] and 'zcalibrate' not in self._cur_panels:
                 self.show_panel("zcalibrate")
             if ("screws_tilt_adjust" in data and "max_deviation" in data['screws_tilt_adjust']
