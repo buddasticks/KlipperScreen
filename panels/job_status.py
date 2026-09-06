@@ -1095,6 +1095,11 @@ class Panel(ScreenPanel):
         self.update_progress(0.0)
         self.set_state("printing")
 
+        # If the print was launched from KlipperScreen, request Job Status
+        # immediately instead of waiting for the next Moonraker update.
+        if hasattr(self._screen, "_queue_job_status"):
+            self._screen._queue_job_status()
+
     # ------------------------------------------------------------------ process_update
 
     def process_update(self, action, data):
